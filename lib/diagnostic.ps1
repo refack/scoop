@@ -67,3 +67,14 @@ function Get-WindowsDeveloperModeStatus {
 
     return $true
 }
+
+function Get-WindowsSymlinkPrivilage {
+    $HasSymlinkPriv = [bool](& whoami /priv | Select-String "SeCreateSymbolicLinkPrivilege")
+    if (!$HasSymlinkPriv) {
+        warn "Operations relevant to symlinks may fail without proper rights."
+        Write-Host "  You may read more about the symlinks support here:"
+        Write-Host "  https://blogs.windows.com/windowsdeveloper/2016/12/02/symlinks-windows-10/"
+        return $false
+    }
+    return $true
+}
