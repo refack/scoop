@@ -17,7 +17,7 @@ if ($adminPrivileges -and $env:USERNAME -ne 'WDAGUtilityAccount') {
 
 $issues += !(check_main_bucket)
 $issues += !(check_long_paths)
-$issues += !(Get-WindowsDeveloperModeStatus)
+$issues += !(Get-WindowsSymlinkPrivilage)
 
 if (!(Test-HelperInstalled -Helper 7zip) -and !(get_config USE_EXTERNAL_7ZIP)) {
     warn "'7-Zip' is not installed! It's required for unpacking most programs. Please Run 'scoop install 7zip'."
