@@ -14,6 +14,7 @@
 . "$PSScriptRoot\..\lib\manifest.ps1" # 'Select-CurrentVersion' (indirectly)
 . "$PSScriptRoot\..\lib\versions.ps1" # 'Select-CurrentVersion'
 . "$PSScriptRoot\..\lib\install.ps1" # persist related
+. "$PSScriptRoot\..\lib\cleanup.ps1" # 'cleanup'
 
 $opt, $apps, $err = getopt $args 'agk' 'all', 'global', 'cache'
 if ($err) { error "scoop cleanup: $err"; exit 1 }
