@@ -110,6 +110,93 @@ function Sync-Scoop {
     }
 }
 
+function Parse-GitPull {
+    # example ret:
+    #
+    # POST git-upload-pack (226 bytes)
+    # From https://github.com/ScoopInstaller/Main
+    # = [up to date]          master     -> origin/master
+    # = [up to date]          fix-test   -> origin/fix-test
+    # Updating 5cf69323d..3d40cf562
+    # Fast-forward
+    # bucket/azure-cli.json            |  6 +++---
+    # bucket/azure-ps.json             | 10 +++++-----
+    # bucket/balena-cli.json           |  6 ------
+    # bucket/terragrunt.json           | 10 +++++-----
+    # bucket/tflint.json               | 10 +++++-----
+    # bucket/tinymist.json             | 34 ++++++++++++++++++++++++++++++++++
+    # bucket/traefik.json              | 14 +++++++-------
+
+    param(
+        [string[]] $GitOutput = ""
+    )
+
+    $hashRange = $null
+    $files = [System.Collections.Generic.List[object]]::new()
+    # Use a dictionary to handle multiple lines referring to the same file (e.g. diffstat and rename line)
+    $fileInfo = [ordered]@{}
+
+    # --- 1. Find Hash Range ---
+    $hashLine = $GitOutput | Select-String -Pattern '^Updating ([\da-f\.]+\.\.[\da-f\.]+)'
+    if ($hashLine) {
+        $hashRange = $hashLine.Matches[0].Groups[1].Value
+    }
+
+    # --- 2. Parse File Statuses ---
+    # Process explicit mode changes first, as they are more reliable
+    foreach ($line in $GitOutput) {
+        if ($line -match '^\s*create mode \d+ (.+)') {
+            $filePath = $matches[1].Trim()
+            $fileInfo[$filePath] = @{ Path = $filePath; Status = 'added' }
+        }
+        elseif ($line -match '^\s*delete mode \d+ (.+)') {
+            $filePath = $matches[1].Trim()
+            $fileInfo[$filePath] = @{ Path = $filePath; Status = 'deleted' }
+        }
+        elseif ($line -match '^\s*rename (.+?)(?: => (.+))? \(([\d%]+)\)') {
+            $renamePart = $matches[1].Trim()
+            $toPart = $matches[2]
+
+            if ($renamePart -match '^{(.+?)\s+=>\s+(.+?)}/(.+)') {
+                $oldDir = $matches[1]
+                $newDir = $matches[2]
+                $file = $matches[3]
+                $oldPath = Join-Path $oldDir $file
+                $newPath = Join-Path $newDir $file
+                $fileInfo[$newPath] = @{ Path = $newPath; Status = 'renamed'; OldPath = $oldPath }
+            } elseif ($toPart) {
+                $oldPath = $renamePart
+                $newPath = $toPart.Trim()
+                $fileInfo[$newPath] = @{ Path = $newPath; Status = 'renamed'; OldPath = $oldPath }
+            }
+        }
+    }
+
+    # Process diffstat lines for files not already identified by explicit mode changes
+    foreach ($line in $GitOutput) {
+        if ($line -match '^\s*(?<path>.+?)\s+\|\s+\d+\s+(?<changes>[+\-]+)$') {
+            $filePath = $matches.path.Trim()
+            if ($fileInfo.Contains($filePath)) { continue }
+
+            $changes = $matches.changes
+            if ($changes.Contains('+') -and -not $changes.Contains('-')) {
+                $fileInfo[$filePath] = @{ Path = $filePath; Status = 'added' }
+            } elseif ($changes.Contains('-') -and -not $changes.Contains('+')) {
+                $fileInfo[$filePath] = @{ Path = $filePath; Status = 'deleted' }
+            } else {
+                $fileInfo[$filePath] = @{ Path = $filePath; Status = 'changed' }
+            }
+        }
+    }
+
+    # Convert the dictionary to a list of PSCustomObjects
+    foreach ($key in $fileInfo.Keys) {
+        $files.Add([PSCustomObject]$fileInfo[$key])
+    }
+
+    return $hashRange, $files
+}
+
 function Sync-Bucket {
     Param (
         [Switch]$Log
@@ -131,85 +218,32 @@ function Sync-Bucket {
 
     $buckets = Get-LocalBucket | ForEach-Object {
         $path = Find-BucketDirectory $_ -Root
-        return @{
+        $ret  = @{
             name  = $_
-            valid = Test-Path (Join-Path $path '.git')
+            is_git = Test-Path -PathType Container (Join-Path $path '.git')
             path  = $path
         }
+        if (-not $ret.is_git) { Write-Host "'$($ret.name)' is not a git repository. Skipped." }
+        return $ret
     }
 
-    $buckets | Where-Object { !$_.valid } | ForEach-Object { Write-Host "'$($_.name)' is not a git repository. Skipped." }
+    $retList = $buckets | Where-Object is_git | ForEach-Object {
+        $bucketName = $_.name
+        $bucketLoc = $_.path
+        # $bucketLocInner = Find-BucketDirectory $bucketName
 
-    $updatedFiles = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
-    $removedFiles = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
-    if ($PSVersionTable.PSVersion.Major -ge 7) {
-        # Parallel parameter is available since PowerShell 7
-        $buckets | Where-Object { $_.valid } | ForEach-Object -ThrottleLimit 5 -Parallel {
-            . "$using:PSScriptRoot\core.ps1"
-            . "$using:PSScriptRoot\buckets.ps1"
+        Write-Host "Updating Bucket $bucketName ($bucketLoc)"
 
-            $name = $_.name
-            $bucketLoc = $_.path
-            $innerBucketLoc = Find-BucketDirectory $name
+        $git_pull_ret = Invoke-Git -Path $bucketLoc -ArgumentList @('pull', '--verbose')
+        $hashRange, $affectedFiles = Parse-GitPull $git_pull_ret
 
-            $previousCommit = Invoke-Git -Path $bucketLoc -ArgumentList @('rev-parse', 'HEAD')
-            Invoke-Git -Path $bucketLoc -ArgumentList @('pull', '-q')
-            if ($using:Log) {
-                Invoke-GitLog -Path $bucketLoc -Name $name -CommitHash $previousCommit
-            }
-            if (get_config USE_SQLITE_CACHE) {
-                Invoke-Git -Path $bucketLoc -ArgumentList @('diff', '--name-status', $previousCommit) | ForEach-Object {
-                    $status, $file = $_ -split '\s+', 2
-                    $filePath = Join-Path $bucketLoc $file
-                    if ($filePath -match "^$([regex]::Escape($innerBucketLoc)).*\.json$") {
-                        switch ($status) {
-                            { $_ -in 'A', 'M', 'R' } {
-                                [void]($using:updatedFiles).Add($filePath)
-                            }
-                            'D' {
-                                [void]($using:removedFiles).Add([pscustomobject]@{
-                                        Name   = ([System.IO.FileInfo]$file).BaseName
-                                        Bucket = $name
-                                    })
-                            }
-                        }
-                    }
-                }
-            }
+        if ($Log -and $hashRange) {
+            Invoke-GitLog -Path $bucketLoc -Name $bucketName -CommitHash $hashRange
         }
-    } else {
-        $buckets | Where-Object { $_.valid } | ForEach-Object {
-            $name = $_.name
-            $bucketLoc = $_.path
-            $innerBucketLoc = Find-BucketDirectory $name
 
-            $previousCommit = Invoke-Git -Path $bucketLoc -ArgumentList @('rev-parse', 'HEAD')
-            Invoke-Git -Path $bucketLoc -ArgumentList @('pull', '-q')
-            if ($Log) {
-                Invoke-GitLog -Path $bucketLoc -Name $name -CommitHash $previousCommit
-            }
-            if (get_config USE_SQLITE_CACHE) {
-                Invoke-Git -Path $bucketLoc -ArgumentList @('diff', '--name-status', $previousCommit) | ForEach-Object {
-                    $status, $file = $_ -split '\s+', 2
-                    $filePath = Join-Path $bucketLoc $file
-                    if ($filePath -match "^$([regex]::Escape($innerBucketLoc)).*\.json$") {
-                        switch ($status) {
-                            { $_ -in 'A', 'M', 'R' } {
-                                [void]($updatedFiles).Add($filePath)
-                            }
-                            'D' {
-                                [void]($removedFiles).Add([pscustomobject]@{
-                                        Name   = ([System.IO.FileInfo]$file).BaseName
-                                        Bucket = $name
-                                    })
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        return $affectedFiles
     }
-    if ((get_config USE_SQLITE_CACHE) -and ($updatedFiles.Count -gt 0 -or $removedFiles.Count -gt 0)) {
+    if ((get_config USE_SQLITE_CACHE) -and $retList) {
         info 'Updating cache...'
         Set-ScoopDB -Path $updatedFiles
         $removedFiles | Remove-ScoopDBItem
@@ -283,7 +317,7 @@ function restore_app($ctx, $old_manifest, $old_version, $backup) {
     }
 }
 
-function update_app($app, $global, $force = $false, $quiet = $false, $independent, $suggested, $failed, $use_cache = $true, $check_hash = $true) {
+function update_app($app, $global, $force = $false, $quiet = $false, $independent, $suggested, $failed, $use_cache = $true, $check_hash = $true, $cleanup = $false) {
     $app_key = if ($global) { "$app (global)" } else { $app }
     $app_name = $app
     $unlinked = $false
@@ -396,7 +430,8 @@ function update_app($app, $global, $force = $false, $quiet = $false, $independen
     # endregion Workaround
 
     $dir = versiondir $app $old_version $global
-    $persist_dir = persistdir $app $global
+    # $persist_dir needed for the script context, assigning it this way hides it from PSScriptAnalyzer
+    Set-Variable -Name persist_dir -Value (persistdir $app $global)
     $ctx = [PSCustomObject]@{
         app          = $app
         dir          = $dir
@@ -432,6 +467,9 @@ function update_app($app, $global, $force = $false, $quiet = $false, $independen
 
         Invoke-HookScript -HookType 'post_uninstall' -Manifest $old_manifest -Arch $architecture
 
+    # 'cleanup' needs the bare name, but the next lines qualify it with the bucket or url
+    $bare_app = $app
+
         if ($bucket) {
             # add bucket name it was installed from
             $app = "$bucket/$app"
@@ -454,6 +492,14 @@ function update_app($app, $global, $force = $false, $quiet = $false, $independen
         # the scope specific key keeps the other scope from restoring
         if ($failed.ContainsKey($app_key)) {
             restore_app $ctx $old_manifest $old_version $backup
+
+        } elseif ($cleanup -and ((Select-CurrentVersion -AppName $bare_app -Global:$global) -eq $version)) {
+            # a failure here must not prevent the remaining apps from being updated
+            try {
+                cleanup $bare_app $global $false $false
+            } catch {
+                warn "Failed to clean up old versions of '$bare_app': $($_.Exception.Message)"
+            }
         }
     } catch {
         $failed[$app_key] = $_.Exception.Message
