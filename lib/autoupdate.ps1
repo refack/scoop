@@ -229,7 +229,8 @@ function get_hash_for_app([String] $app, $config, [String] $version, [String] $u
 
     debug $substitutions
 
-    $hashfile_url = substitute $config.url $substitutions
+    $template = gpod $config 'url' ''
+    $hashfile_url = substitute -entity $template -params $substitutions
     debug $hashfile_url
     if ($hashfile_url) {
         Write-Host 'Searching hash for ' -ForegroundColor DarkYellow -NoNewline
@@ -385,7 +386,8 @@ function Update-ManifestProperty {
                 if ($Manifest.hash) {
                     # Global
                     $newURL = substitute $Manifest.autoupdate.url $Substitutions
-                    $newHash = HashHelper -AppName $AppName -Version $Version -HashExtraction $Manifest.autoupdate.hash -URL $newURL -Substitutions $Substitutions
+                    $hashURL = gpod $Manifest.autoupdate 'hash'
+                    $newHash = HashHelper -AppName $AppName -Version $Version -HashExtraction $hashURL -URL $newURL -Substitutions $Substitutions
                     $Manifest.hash, $hasPropertyChanged = PropertyHelper -Property $Manifest.hash -Value $newHash
                     $hasManifestChanged = $hasManifestChanged -or $hasPropertyChanged
                 } else {
@@ -625,11 +627,11 @@ function HashHelper {
     $hash = @()
     for ($i = 0; $i -lt $URL.Length; $i++) {
         if ($null -eq $HashExtraction) {
-            $currentHashExtraction = $null
+            $currentHashExtraction = @{}
         } else {
             $currentHashExtraction = $HashExtraction[$i], $HashExtraction[-1] | Select-Object -First 1
         }
-        $hash += get_hash_for_app $AppName $currentHashExtraction $Version $URL[$i] $Substitutions
+        $hash += get_hash_for_app -app $AppName -config $currentHashExtraction -version $Version -url $URL[$i] -substitutions $Substitutions
         if ($null -eq $hash[$i]) {
             throw "Could not update $AppName, hash for $(url_remote_filename $URL[$i]) failed!"
         }

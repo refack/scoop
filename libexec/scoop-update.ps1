@@ -13,6 +13,7 @@
 #   -s, --skip-hash-check  Skip hash validation (use with caution!)
 #   -q, --quiet            Hide extraneous messages
 #   -a, --all              Update all apps (alternative to '*')
+#   -c, --cleanup          Remove the old versions of each app that is updated
 
 . "$PSScriptRoot\..\lib\getopt.ps1"
 . "$PSScriptRoot\..\lib\json.ps1" # 'save_install_info' in 'manifest.ps1' (indirectly)
@@ -27,11 +28,12 @@
 . "$PSScriptRoot\..\lib\install.ps1"
 . "$PSScriptRoot\..\lib\download.ps1"
 . "$PSScriptRoot\..\lib\update.ps1"
+. "$PSScriptRoot\..\lib\cleanup.ps1"
 if (get_config USE_SQLITE_CACHE) {
     . "$PSScriptRoot\..\lib\database.ps1"
 }
 
-$opt, $apps, $err = getopt $args 'gfiksqa' 'global', 'force', 'independent', 'no-cache', 'skip-hash-check', 'quiet', 'all'
+$opt, $apps, $err = getopt $args 'gfiksqac' 'global', 'force', 'independent', 'no-cache', 'skip-hash-check', 'quiet', 'all', 'cleanup'
 if ($err) { error "scoop update: $err"; exit 1 }
 $global = $opt.g -or $opt.global
 $force = $opt.f -or $opt.force
@@ -40,6 +42,7 @@ $use_cache = !($opt.k -or $opt.'no-cache')
 $quiet = $opt.q -or $opt.quiet
 $independent = $opt.i -or $opt.independent
 $all = $opt.a -or $opt.all
+$cleanup = $opt.c -or $opt.cleanup
 
 if (($PSVersionTable.PSVersion.Major) -lt 5) {
     # check powershell version
@@ -57,6 +60,10 @@ if (-not ($apps -or $all)) {
     }
     if (!$use_cache) {
         error 'scoop update: --no-cache is invalid when <app> is not specified.'
+        exit 1
+    }
+    if ($cleanup) {
+        error 'scoop update: --cleanup is invalid when <app> is not specified.'
         exit 1
     }
     Sync-Scoop -Log:$show_update_log
@@ -145,7 +152,7 @@ if (-not ($apps -or $all)) {
     $outdated | ForEach-Object {
     $current = $_
     try {
-        update_app @current $force $quiet $independent $suggested $failed $use_cache $check_hash
+        update_app @current $force $quiet $independent $suggested $failed $use_cache $check_hash $cleanup
     } catch {
         $key = if ($current[1]) { "$($current[0]) (global)" } else { $current[0] }
         $failed[$key] = $_.Exception.Message
