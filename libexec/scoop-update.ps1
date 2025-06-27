@@ -13,6 +13,7 @@
 #   -s, --skip-hash-check  Skip hash validation (use with caution!)
 #   -q, --quiet            Hide extraneous messages
 #   -a, --all              Update all apps (alternative to '*')
+#   -c, --cleanup          Remove the old versions of each app that is updated
 
 . "$PSScriptRoot\..\lib\getopt.ps1"
 . "$PSScriptRoot\..\lib\json.ps1" # 'save_install_info' in 'manifest.ps1' (indirectly)
@@ -25,11 +26,12 @@
 . "$PSScriptRoot\..\lib\depends.ps1"
 . "$PSScriptRoot\..\lib\install.ps1"
 . "$PSScriptRoot\..\lib\download.ps1"
+. "$PSScriptRoot\..\lib\cleanup.ps1"
 if (get_config USE_SQLITE_CACHE) {
     . "$PSScriptRoot\..\lib\database.ps1"
 }
 
-$opt, $apps, $err = getopt $args 'gfiksqa' 'global', 'force', 'independent', 'no-cache', 'skip-hash-check', 'quiet', 'all'
+$opt, $apps, $err = getopt $args 'gfiksqac' 'global', 'force', 'independent', 'no-cache', 'skip-hash-check', 'quiet', 'all', 'cleanup'
 if ($err) { error "scoop update: $err"; exit 1 }
 $global = $opt.g -or $opt.global
 $force = $opt.f -or $opt.force
@@ -38,6 +40,7 @@ $use_cache = !($opt.k -or $opt.'no-cache')
 $quiet = $opt.q -or $opt.quiet
 $independent = $opt.i -or $opt.independent
 $all = $opt.a -or $opt.all
+$cleanup = $opt.c -or $opt.cleanup
 
 # load config
 $configRepo = get_config SCOOP_REPO
@@ -76,9 +79,9 @@ function Sync-Scoop {
 
     Write-Host 'Updating Scoop...'
     $currentdir = versiondir 'scoop' 'current'
-    if (!(Test-Path "$currentdir\.git")) {
+    $is_git = Test-Path "$currentdir\.git"
+    if (!$is_git) {
         $newdir = "$currentdir\..\new"
-        $olddir = "$currentdir\..\old"
 
         # get git scoop
         Invoke-Git -ArgumentList @('clone', '-q', $configRepo, '--branch', $configBranch, '--single-branch', $newdir)
@@ -152,6 +155,96 @@ function Sync-Scoop {
     shim "$currentdir\bin\scoop.ps1" $false
 }
 
+
+function Parse-GitPull {
+    # example ret:
+    #
+    # POST git-upload-pack (226 bytes)
+    # From https://github.com/ScoopInstaller/Main
+    # = [up to date]          master     -> origin/master
+    # = [up to date]          fix-test   -> origin/fix-test
+    # Updating 5cf69323d..3d40cf562
+    # Fast-forward
+    # bucket/azure-cli.json            |  6 +++---
+    # bucket/azure-ps.json             | 10 +++++-----
+    # bucket/balena-cli.json           |  6 ------
+    # bucket/terragrunt.json           | 10 +++++-----
+    # bucket/tflint.json               | 10 +++++-----
+    # bucket/tinymist.json             | 34 ++++++++++++++++++++++++++++++++++
+    # bucket/traefik.json              | 14 +++++++-------
+
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]] $GitOutput
+    )
+
+    $hashRange = $null
+    $files = [System.Collections.Generic.List[object]]::new()
+    # Use a dictionary to handle multiple lines referring to the same file (e.g. diffstat and rename line)
+    $fileInfo = [ordered]@{}
+
+    # --- 1. Find Hash Range ---
+    $hashLine = $GitOutput | Select-String -Pattern '^Updating ([\da-f\.]+\.\.[\da-f\.]+)'
+    if ($hashLine) {
+        $hashRange = $hashLine.Matches[0].Groups[1].Value
+    }
+
+    # --- 2. Parse File Statuses ---
+    # Process explicit mode changes first, as they are more reliable
+    foreach ($line in $GitOutput) {
+        if ($line -match '^\s*create mode \d+ (.+)') {
+            $filePath = $matches[1].Trim()
+            $fileInfo[$filePath] = @{ Path = $filePath; Status = 'added' }
+        }
+        elseif ($line -match '^\s*delete mode \d+ (.+)') {
+            $filePath = $matches[1].Trim()
+            $fileInfo[$filePath] = @{ Path = $filePath; Status = 'deleted' }
+        }
+        elseif ($line -match '^\s*rename (.+?)(?: => (.+))? \(([\d%]+)\)') {
+            $renamePart = $matches[1].Trim()
+            $toPart = $matches[2]
+
+            if ($renamePart -match '^{(.+?)\s+=>\s+(.+?)}/(.+)') {
+                $oldDir = $matches[1]
+                $newDir = $matches[2]
+                $file = $matches[3]
+                $oldPath = Join-Path $oldDir $file
+                $newPath = Join-Path $newDir $file
+                $fileInfo[$newPath] = @{ Path = $newPath; Status = 'renamed'; OldPath = $oldPath }
+            } elseif ($toPart) {
+                $oldPath = $renamePart
+                $newPath = $toPart.Trim()
+                $fileInfo[$newPath] = @{ Path = $newPath; Status = 'renamed'; OldPath = $oldPath }
+            }
+        }
+    }
+
+    # Process diffstat lines for files not already identified by explicit mode changes
+    foreach ($line in $GitOutput) {
+        if ($line -match '^\s*(?<path>.+?)\s+\|\s+\d+\s+(?<changes>[+\-]+)$') {
+            $filePath = $matches.path.Trim()
+            if ($fileInfo.Contains($filePath)) { continue }
+
+            $changes = $matches.changes
+            if ($changes.Contains('+') -and -not $changes.Contains('-')) {
+                $fileInfo[$filePath] = @{ Path = $filePath; Status = 'added' }
+            } elseif ($changes.Contains('-') -and -not $changes.Contains('+')) {
+                $fileInfo[$filePath] = @{ Path = $filePath; Status = 'deleted' }
+            } else {
+                $fileInfo[$filePath] = @{ Path = $filePath; Status = 'changed' }
+            }
+        }
+    }
+
+    # Convert the dictionary to a list of PSCustomObjects
+    foreach ($key in $fileInfo.Keys) {
+        $files.Add([PSCustomObject]$fileInfo[$key])
+    }
+
+    return $hashRange, $files
+}
+
+
 function Sync-Bucket {
     Param (
         [Switch]$Log
@@ -173,85 +266,32 @@ function Sync-Bucket {
 
     $buckets = Get-LocalBucket | ForEach-Object {
         $path = Find-BucketDirectory $_ -Root
-        return @{
+        $ret  = @{
             name  = $_
-            valid = Test-Path (Join-Path $path '.git')
+            is_git = Test-Path -PathType Container (Join-Path $path '.git')
             path  = $path
         }
+        if (-not $ret.is_git) { Write-Host "'$($ret.name)' is not a git repository. Skipped." }
+        return $ret
     }
 
-    $buckets | Where-Object { !$_.valid } | ForEach-Object { Write-Host "'$($_.name)' is not a git repository. Skipped." }
+    $retList = $buckets | Where-Object is_git | ForEach-Object {
+        $bucketName = $_.name
+        $bucketLoc = $_.path
+        # $bucketLocInner = Find-BucketDirectory $bucketName
 
-    $updatedFiles = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
-    $removedFiles = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
-    if ($PSVersionTable.PSVersion.Major -ge 7) {
-        # Parallel parameter is available since PowerShell 7
-        $buckets | Where-Object { $_.valid } | ForEach-Object -ThrottleLimit 5 -Parallel {
-            . "$using:PSScriptRoot\..\lib\core.ps1"
-            . "$using:PSScriptRoot\..\lib\buckets.ps1"
+        Write-Host "Updating Bucket $bucketName ($bucketLoc)"
 
-            $name = $_.name
-            $bucketLoc = $_.path
-            $innerBucketLoc = Find-BucketDirectory $name
+        $git_pull_ret = Invoke-Git -Path $bucketLoc -ArgumentList @('pull', '--verbose')
+        $hashRange, $affectedFiles = Parse-GitPull $git_pull_ret
 
-            $previousCommit = Invoke-Git -Path $bucketLoc -ArgumentList @('rev-parse', 'HEAD')
-            Invoke-Git -Path $bucketLoc -ArgumentList @('pull', '-q')
-            if ($using:Log) {
-                Invoke-GitLog -Path $bucketLoc -Name $name -CommitHash $previousCommit
-            }
-            if (get_config USE_SQLITE_CACHE) {
-                Invoke-Git -Path $bucketLoc -ArgumentList @('diff', '--name-status', $previousCommit) | ForEach-Object {
-                    $status, $file = $_ -split '\s+', 2
-                    $filePath = Join-Path $bucketLoc $file
-                    if ($filePath -match "^$([regex]::Escape($innerBucketLoc)).*\.json$") {
-                        switch ($status) {
-                            { $_ -in 'A', 'M', 'R' } {
-                                [void]($using:updatedFiles).Add($filePath)
-                            }
-                            'D' {
-                                [void]($using:removedFiles).Add([pscustomobject]@{
-                                        Name   = ([System.IO.FileInfo]$file).BaseName
-                                        Bucket = $name
-                                    })
-                            }
-                        }
-                    }
-                }
-            }
+        if ($Log -and $hashRange) {
+            Invoke-GitLog -Path $bucketLoc -Name $bucketName -CommitHash $hashRange
         }
-    } else {
-        $buckets | Where-Object { $_.valid } | ForEach-Object {
-            $name = $_.name
-            $bucketLoc = $_.path
-            $innerBucketLoc = Find-BucketDirectory $name
 
-            $previousCommit = Invoke-Git -Path $bucketLoc -ArgumentList @('rev-parse', 'HEAD')
-            Invoke-Git -Path $bucketLoc -ArgumentList @('pull', '-q')
-            if ($Log) {
-                Invoke-GitLog -Path $bucketLoc -Name $name -CommitHash $previousCommit
-            }
-            if (get_config USE_SQLITE_CACHE) {
-                Invoke-Git -Path $bucketLoc -ArgumentList @('diff', '--name-status', $previousCommit) | ForEach-Object {
-                    $status, $file = $_ -split '\s+', 2
-                    $filePath = Join-Path $bucketLoc $file
-                    if ($filePath -match "^$([regex]::Escape($innerBucketLoc)).*\.json$") {
-                        switch ($status) {
-                            { $_ -in 'A', 'M', 'R' } {
-                                [void]($updatedFiles).Add($filePath)
-                            }
-                            'D' {
-                                [void]($removedFiles).Add([pscustomobject]@{
-                                        Name   = ([System.IO.FileInfo]$file).BaseName
-                                        Bucket = $name
-                                    })
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        return $affectedFiles
     }
-    if ((get_config USE_SQLITE_CACHE) -and ($updatedFiles.Count -gt 0 -or $removedFiles.Count -gt 0)) {
+    if ((get_config USE_SQLITE_CACHE) -and $retList) {
         info 'Updating cache...'
         Set-ScoopDB -Path $updatedFiles
         $removedFiles | Remove-ScoopDBItem
@@ -336,7 +376,8 @@ function update($app, $global, $quiet = $false, $independent, $suggested, $use_c
     # endregion Workaround
 
     $dir = versiondir $app $old_version $global
-    $persist_dir = persistdir $app $global
+    # $persist_dir needed for the script context, assigning it this way hides it from PSScriptAnalyzer
+    Set-Variable -Name persist_dir -Value (persistdir $app $global)
 
     Invoke-HookScript -HookType 'pre_uninstall' -Manifest $old_manifest -Arch $architecture
 
@@ -366,6 +407,9 @@ function update($app, $global, $quiet = $false, $independent, $suggested, $use_c
 
     Invoke-HookScript -HookType 'post_uninstall' -Manifest $old_manifest -Arch $architecture
 
+    # 'cleanup' needs the bare name, but the next lines qualify it with the bucket or url
+    $bare_app = $app
+
     if ($bucket) {
         # add bucket name it was installed from
         $app = "$bucket/$app"
@@ -383,6 +427,17 @@ function update($app, $global, $quiet = $false, $independent, $suggested, $use_c
         ensure_none_failed $apps
         $apps.Where({ !(installed $_) }) + $app | ForEach-Object { install_app $_ $architecture $global $suggested $use_cache $check_hash }
     }
+
+    # only clean up once the new version is the one actually linked, so a failed
+    # install keeps the old version around to fall back on
+    if ($cleanup -and ((Select-CurrentVersion -AppName $bare_app -Global:$global) -eq $version)) {
+        # a failure here must not prevent the remaining apps from being updated
+        try {
+            cleanup $bare_app $global $false $false
+        } catch {
+            warn "Failed to clean up old versions of '$bare_app': $($_.Exception.Message)"
+        }
+    }
 }
 
 if (-not ($apps -or $all)) {
@@ -392,6 +447,10 @@ if (-not ($apps -or $all)) {
     }
     if (!$use_cache) {
         error 'scoop update: --no-cache is invalid when <app> is not specified.'
+        exit 1
+    }
+    if ($cleanup) {
+        error 'scoop update: --cleanup is invalid when <app> is not specified.'
         exit 1
     }
     Sync-Scoop -Log:$show_update_log
