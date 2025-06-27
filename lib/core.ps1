@@ -1074,7 +1074,6 @@ function get_shim_path() {
 }
 
 function Get-DefaultArchitecture {
-    $arch = get_config DEFAULT_ARCHITECTURE
     $system = if (${env:ProgramFiles(Arm)}) {
         'arm64'
     } elseif ([System.Environment]::Is64BitOperatingSystem) {
@@ -1082,15 +1081,12 @@ function Get-DefaultArchitecture {
     } else {
         '32bit'
     }
-    if ($null -eq $arch) {
+    $arch = get_config DEFAULT_ARCHITECTURE $system
+    try {
+        $arch = Format-ArchitectureString $arch
+    } catch {
+        warn 'Invalid default architecture configured. Determining default system architecture'
         $arch = $system
-    } else {
-        try {
-            $arch = Format-ArchitectureString $arch
-        } catch {
-            warn 'Invalid default architecture configured. Determining default system architecture'
-            $arch = $system
-        }
     }
     return $arch
 }
@@ -1316,10 +1312,10 @@ if ($pathExpected) {
 $scoopConfig = load_cfg $configFile
 
 # Scoop root directory
-$scoopdir = $env:SCOOP, (get_config ROOT_PATH), "$PSScriptRoot\..\..\..\..", "$([System.Environment]::GetFolderPath('UserProfile'))\scoop" | Where-Object { $_ } | Select-Object -First 1 | Get-AbsolutePath
+$scoopdir = $env:SCOOP, (get_config ROOT_PATH "$PSScriptRoot\..\..\..\.."), "$([System.Environment]::GetFolderPath('UserProfile'))\scoop" | Where-Object { $_ } | Select-Object -First 1 | Get-AbsolutePath
 
 # Scoop global apps directory
-$globaldir = $env:SCOOP_GLOBAL, (get_config GLOBAL_PATH), "$([System.Environment]::GetFolderPath('CommonApplicationData'))\scoop" | Where-Object { $_ } | Select-Object -First 1 | Get-AbsolutePath
+$globaldir = $env:SCOOP_GLOBAL, (get_config GLOBAL_PATH "$([System.Environment]::GetFolderPath('CommonApplicationData'))\scoop") | Where-Object { $_ } | Select-Object -First 1 | Get-AbsolutePath
 
 # Scoop cache directory
 # Note: Setting the SCOOP_CACHE environment variable to use a shared directory
