@@ -822,12 +822,29 @@ function Invoke-ExternalCommand {
     if ($redirectToLogFile) {
         # we do this to remove a deadlock potential
         # ref: https://docs.microsoft.com/en-us/dotnet/api/system.diagnostics.process.standardoutput?view=netframework-4.5#remarks
-        $stdoutTask = $Process.StandardOutput.ReadToEndAsync()
         $stderrTask = $Process.StandardError.ReadToEndAsync()
+
+        $outputLines = @()
+        try {
+            while (-not $Process.StandardOutput.EndOfStream) {
+                $line = $Process.StandardOutput.ReadLine()
+                if ($line -match '(\d+)%') {
+                    $percent = [int]($matches[1])
+                    Write-Progress -Activity $Process.ProcessName -Status 'Progress...' -PercentComplete $percent
+                }
+                $outputLines += ($line.Replace("`r", "`n") + "`n")
+            }
+        } catch {
+            if ($Activity) {
+                Write-Host "error tracking $FilePath" -ForegroundColor DarkRed
+                Write-Host $_ -ForegroundColor DarkRed
+            }
+        }
     }
     $Process.WaitForExit()
     if ($redirectToLogFile) {
-        Out-UTF8File -FilePath $LogPath -Append -InputObject $stdoutTask.Result
+        Out-UTF8File -FilePath $LogPath -Append -InputObject $outputLines
+        Out-UTF8File -FilePath $LogPath -Append -InputObject "############ strerr ############"
         Out-UTF8File -FilePath $LogPath -Append -InputObject $stderrTask.Result
     }
     if ($Process.ExitCode -ne 0) {

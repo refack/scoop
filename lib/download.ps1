@@ -154,7 +154,8 @@ function Invoke-Download ($url, $to, $cookies, $progress) {
     if ($progress -and ($total -gt 0)) {
         [console]::CursorVisible = $false
         function Trace-DownloadProgress ($read) {
-            Write-DownloadProgress $read $total $url
+            $p = 100 * $read / $total
+            Write-Progress -Activity "Downloaded $read" -PercentComplete $p
         }
     } else {
         Write-Host "Downloading $url ($(filesize $total))..."
@@ -194,67 +195,6 @@ function Invoke-Download ($url, $to, $cookies, $progress) {
         }
         $wres.close()
     }
-}
-
-function Format-DownloadProgress ($url, $read, $total, $console) {
-    $filename = url_remote_filename $url
-
-    # calculate current percentage done
-    $p = [math]::Round($read / $total * 100, 0)
-
-    # pre-generate LHS and RHS of progress string
-    # so we know how much space we have
-    $left = "$filename ($(filesize $total))"
-    $right = [string]::Format('{0,3}%', $p)
-
-    # calculate remaining width for progress bar
-    $midwidth = $console.BufferSize.Width - ($left.Length + $right.Length + 8)
-
-    # calculate how many characters are completed
-    $completed = [math]::Abs([math]::Round(($p / 100) * $midwidth, 0) - 1)
-
-    # generate dashes to symbolise completed
-    if ($completed -gt 1) {
-        $dashes = [string]::Join('', ((1..$completed) | ForEach-Object { '=' }))
-    }
-
-    # this is why we calculate $completed - 1 above
-    $dashes += switch ($p) {
-        100 { '=' }
-        default { '>' }
-    }
-
-    # the remaining characters are filled with spaces
-    $spaces = switch ($dashes.Length) {
-        $midwidth { [string]::Empty }
-        default {
-            [string]::Join('', ((1..($midwidth - $dashes.Length)) | ForEach-Object { ' ' }))
-        }
-    }
-
-    "$left [$dashes$spaces] $right"
-}
-
-function Write-DownloadProgress ($read, $total, $url) {
-    $console = $Host.UI.RawUI
-    $left = $console.CursorPosition.X
-    $top = $console.CursorPosition.Y
-    $width = $console.BufferSize.Width
-
-    if ($read -eq 0) {
-        $maxOutputLength = $(Format-DownloadProgress $url 100 $total $console).Length
-        if (($left + $maxOutputLength) -gt $width) {
-            # not enough room to print progress on this line
-            # print on new line
-            Write-Host
-            $left = 0
-            $top = $top + 1
-            if ($top -gt $console.CursorPosition.Y) { $top = $console.CursorPosition.Y }
-        }
-    }
-
-    Write-Host $(Format-DownloadProgress $url $read $total $console) -NoNewline
-    [console]::SetCursorPosition($left, $top)
 }
 
 ## Aria2 downloader
