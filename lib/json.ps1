@@ -196,7 +196,7 @@ function normalize_values([psobject] $json) {
                 # Array of Arrays
                 $resulted_arrs = @()
                 foreach ($element in $_.Value) {
-                    if ($element.Count -eq 1) {
+                    if ((gpod $element 'Count') -eq 1) {
                         $resulted_arrs += $element
                     } else {
                         $resulted_arrs += , $element
