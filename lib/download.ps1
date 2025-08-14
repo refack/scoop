@@ -570,7 +570,7 @@ function Get-Encoding($wc) {
     if ($null -ne $wc.PSObject.Properties['ResponseHeaders']) {
         $headers = $wc.ResponseHeaders
     } else {
-        $headers = $wc.Headers
+        $headers = gpod $wc 'Headers' @{}
     }
     if ($null -ne $headers -and $headers['Content-Type'] -match 'charset=([^;]*)') {
         return [System.Text.Encoding]::GetEncoding($Matches[1])
