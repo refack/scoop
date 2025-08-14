@@ -1,3 +1,47 @@
+function Test-HasProperty {
+    [OutputType([bool])]
+    param(
+        $Object,
+        [string] $Name
+    )
+    if ($null -eq $Object) {
+        return $false
+    }
+    if ($Object -is [System.Collections.IDictionary]) {
+        return $Object.Contains($Name)
+    }
+    return ($null -ne $Object.PSObject.Properties[$Name])
+}
+
+function Test-HasMethod {
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)] $Object,
+        [Parameter(Mandatory)] [string] $Name
+    )
+    if ($null -eq $Object) {
+        return $false
+    }
+    return ($null -ne $Object.PSObject.Methods[$Name])
+}
+
+function Get-PropertyOrDefault {
+    param(
+        [Parameter(Mandatory)] $Object,
+        [Parameter(Mandatory)] [string] $Name,
+        $Default = $null
+    )
+    $ret = $Default
+    if (-not (Test-HasProperty $Object $Name)) {}
+    elseif ($Object -is [PSCustomObject]) {
+        $ret = $Object.$Name
+    } elseif ($Object -is [System.Collections.ICollection]) {
+        $ret = $Object[$Name]
+    }
+    return , $ret
+}
+Set-Alias -Name gpod -Value Get-PropertyOrDefault
+
 function Optimize-SecurityProtocol {
     # .NET Framework 4.7+ has a default security protocol called 'SystemDefault',
     # which allows the operating system to choose the best protocol to use.
@@ -54,10 +98,7 @@ function load_cfg($file) {
 
 function get_config($name, $default) {
     $name = $name.ToLowerInvariant()
-    if ($null -eq $scoopConfig.$name -and $null -ne $default) {
-        return $default
-    }
-    return $scoopConfig.$name
+    return gpod $scoopConfig $name $default
 }
 
 function set_config {
@@ -206,7 +247,7 @@ function Invoke-Git {
         $ArgumentList
     )
 
-    $proxy = get_config PROXY
+    $proxy = get_config PROXY ''
     $git = Get-HelperPath -Helper Git
 
     if ($WorkingDirectory) {
@@ -534,6 +575,7 @@ function Get-CommandPath {
 
 function Test-HelperInstalled {
     [CmdletBinding()]
+    [OutputType([Boolean])]
     param(
         [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
         [ValidateSet('7zip', 'Lessmsi', 'Innounp', 'Dark', 'Aria2')]
@@ -541,7 +583,9 @@ function Test-HelperInstalled {
         $Helper
     )
 
-    return ![String]::IsNullOrWhiteSpace((Get-HelperPath -Helper $Helper))
+    process {
+        return ![String]::IsNullOrWhiteSpace((Get-HelperPath -Helper $Helper))
+    }
 }
 
 function app_status($app, $global) {
@@ -1054,7 +1098,8 @@ function show_app($app, $bucket, $version) {
 function is_scoop_outdated() {
     $now = [System.DateTime]::Now
     try {
-        $expireHour = (New-TimeSpan (get_config LAST_UPDATE) $now).TotalHours
+        $last_update = get_config LAST_UPDATE $now
+        $expireHour = ($now - $last_update).TotalHours
         return ($expireHour -ge 3)
     } catch {
         # If not System.DateTime
@@ -1065,7 +1110,7 @@ function is_scoop_outdated() {
 
 function Test-ScoopCoreOnHold() {
     $hold_update_until = get_config HOLD_UPDATE_UNTIL
-    if ($null -eq $hold_update_until) {
+    if (-not $hold_update_until) {
         return $false
     }
     $parsed_date = New-Object -TypeName DateTime
@@ -1185,7 +1230,7 @@ $globaldir = $env:SCOOP_GLOBAL, (get_config GLOBAL_PATH "$([System.Environment]:
 #       is experimental and untested. There may be concurrency issues when
 #       multiple users write and access cached files at the same time.
 #       Use at your own risk.
-$cachedir = $env:SCOOP_CACHE, (get_config CACHE_PATH), "$scoopdir\cache" | Where-Object { $_ } | Select-Object -First 1 | Get-AbsolutePath
+$cachedir = $env:SCOOP_CACHE, (get_config CACHE_PATH "$scoopdir\cache") | Where-Object { $_ } | Select-Object -First 1 | Get-AbsolutePath
 
 # Scoop apps' PATH Environment Variable
 $scoopPathEnvVar = switch (get_config USE_ISOLATED_PATH) {
@@ -1195,4 +1240,4 @@ $scoopPathEnvVar = switch (get_config USE_ISOLATED_PATH) {
 }
 
 # OS information
-$WindowsBuild = [System.Environment]::OSVersion.Version.Build
+Set-Item -Path variable:WindowsBuild -Value ([System.Environment]::OSVersion.Version.Build)

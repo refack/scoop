@@ -115,7 +115,7 @@ $Queue | ForEach-Object {
     $substitutions = Get-VersionSubstitution $json.version # 'autoupdate.ps1'
 
     $wc = New-Object Net.Webclient
-    if ($json.checkver.useragent) {
+    if (Test-HasProperty $json.checkver 'useragent') {
         $wc.Headers.Add('User-Agent', (substitute $json.checkver.useragent $substitutions))
     } else {
         $wc.Headers.Add('User-Agent', (Get-UserAgent))
@@ -128,13 +128,13 @@ $Queue | ForEach-Object {
     $xpath = ''
     $replace = ''
 
-    if ($json.checkver.url) {
+    if (Test-HasProperty $json.checkver 'url') {
         $url = $json.checkver.url
     }
 
-    if ($json.checkver.re) {
+    if (Test-HasProperty $json.checkver 're') {
         $regex = $json.checkver.re
-    } elseif ($json.checkver.regex) {
+    } elseif (Test-HasProperty $json.checkver 'regex') {
         $regex = $json.checkver.regex
     }
 
@@ -210,7 +210,7 @@ $Queue | ForEach-Object {
         }
         $regex = "CDATA\[/$path/.*?$sourceforgeRegex.*?\]".Replace('//', '/')
     }
-    if ($json.checkver.sourceforge) {
+    if (Test-HasProperty $json.checkver 'sourceforge') {
         if ($json.checkver.sourceforge -is [System.String] -and $json.checkver.sourceforge -match '(?<project>[\w-]*)(/(?<path>.*))?') {
             $project = $Matches['project']
             $path = $Matches['path']
@@ -225,17 +225,19 @@ $Queue | ForEach-Object {
         $regex = "CDATA\[/$path/.*?$sourceforgeRegex.*?\]".Replace('//', '/')
     }
 
-    if ($json.checkver.jp) {
+    if (Test-HasProperty $json.checkver 'jp') {
         $jsonpath = $json.checkver.jp
     }
-    if ($json.checkver.jsonpath) {
+    if (Test-HasProperty $json.checkver 'jsonpath') {
         $jsonpath = $json.checkver.jsonpath
     }
-    if ($json.checkver.xpath) {
+    if (Test-HasProperty $json.checkver 'xpath') {
         $xpath = $json.checkver.xpath
     }
 
-    if ($json.checkver.replace -is [System.String]) { # If `checkver` is [System.String], it has a method called `Replace`
+    $replacer_obj = gpod $json.checkver 'replace'
+    # Duck type if `checkver.replace` defined and has a method called `Replace`
+    if (Test-HasMethod $replacer_obj 'Replace') {
         $replace = $json.checkver.replace
     }
 
@@ -243,11 +245,11 @@ $Queue | ForEach-Object {
         $regex = $json.checkver
     }
 
-    $reverse = $json.checkver.reverse -and $json.checkver.reverse -eq 'true'
+    $reverse = gpod $json.checkver 'reverse' -eq 'true'
 
     $url = substitute $url $substitutions
 
-    $state = New-Object psobject @{
+    $state = [PSCustomObject]@{
         app      = $name
         file     = $file
         url      = $url
@@ -259,10 +261,9 @@ $Queue | ForEach-Object {
         replace  = $replace
     }
 
-    get_config PRIVATE_HOSTS | Where-Object { $_ -ne $null -and $url -match $_.match } | ForEach-Object {
-        (ConvertFrom-StringData -StringData $_.Headers).GetEnumerator() | ForEach-Object {
-            $wc.Headers[$_.Key] = $_.Value
-        }
+    get_config PRIVATE_HOSTS @() | Where-Object { $url -match (gpod $_ 'match') } | ForEach-Object {
+        gpod $_ 'Headers' '' | ConvertFrom-StringData | ForEach-Object { $wc.Headers[$_.Key] = $_.Value }
+
     }
 
     $wc.Headers.Add('Referer', (strip_filename $url))
@@ -291,7 +292,7 @@ while ($in_progress -gt 0) {
     $regexp = $state.regex
     $jsonpath = $state.jsonpath
     $xpath = $state.xpath
-    $script = $json.checkver.script
+    $script = gpod $json.checkver 'script'
     $reverse = $state.reverse
     $replace = $state.replace
     $expected_ver = $json.version
@@ -445,6 +446,7 @@ while ($in_progress -gt 0) {
                 throw $_
             } else {
                 error $_.Exception.Message
+                error $_.ScriptStackTrace
             }
         }
     }
