@@ -58,8 +58,8 @@ function search_app {
             return
         }
 
-        $Description = $manifest.PSObject.Properties['description']?.Value
-        $Version = $manifest.PSObject.Properties['version']?.Value
+        $Description = gpod $manifest 'description'
+        $Version = gpod $manifest 'version'
 #        # Too much will make the output default to Format-List
 #        if ($desc.Length -gt 40) {
 #            $desc = $desc.Substring(0, 37) + "..."

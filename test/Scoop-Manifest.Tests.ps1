@@ -1,4 +1,5 @@
 BeforeAll {
+    . "$PSScriptRoot\..\lib\core.ps1"
     . "$PSScriptRoot\..\lib\json.ps1"
     . "$PSScriptRoot\..\lib\core.ps1"
     . "$PSScriptRoot\..\lib\manifest.ps1"
@@ -37,6 +38,70 @@ Describe 'JSON parse and beautify' -Tag 'Scoop' {
     }
 }
 
+Describe 'arch_specific' -Tag 'Scoop' {
+    BeforeAll {
+        # real manifests reach arch_specific as PSCustomObject (via parse_json), which is
+        # the shape that regressed - hashtable literals do not exercise the same path
+        $nested = '{ "architecture": { "64bit": { "bin": [["UX\\AutohotkeyUX.exe", "autohotkey"], ["v2\\AutoHotkey32.exe", "autohotkey32"]] } } }' | ConvertFrom-Json
+        $singleNested = '{ "bin": [["AppData\\010Editor.exe", "010editor"]] }' | ConvertFrom-Json
+        $override = '{ "bin": "generic.exe", "architecture": { "64bit": { "bin": "specific.exe" } } }' | ConvertFrom-Json
+        $noBin = '{ "architecture": { "64bit": { "url": "http://example.org/f.zip" } } }' | ConvertFrom-Json
+        # hwinfo shape: url/hash live at the root, the arch block only refines bin/shortcuts
+        $partialArch = '{ "url": "http://root/f.zip", "hash": "abc", "architecture": { "64bit": { "bin": "b.exe" } } }' | ConvertFrom-Json
+    }
+
+    It 'preserves a list of nested entries' {
+        # regression: the outer array was unrolled on return, collapsing every entry into one
+        $bin = @(arch_specific 'bin' $nested '64bit')
+        $bin.Count | Should -Be 2
+        ($bin[0] -join '|') | Should -Be 'UX\AutohotkeyUX.exe|autohotkey'
+        ($bin[1] -join '|') | Should -Be 'v2\AutoHotkey32.exe|autohotkey32'
+    }
+
+    It 'preserves a single nested entry' {
+        $bin = @(arch_specific 'bin' $singleNested '64bit')
+        $bin.Count | Should -Be 1
+        ($bin[0] -join '|') | Should -Be 'AppData\010Editor.exe|010editor'
+    }
+
+    It 'prefers the architecture-specific value and falls back to the root' {
+        arch_specific 'bin' $override '64bit' | Should -Be 'specific.exe'
+        arch_specific 'bin' $override '32bit' | Should -Be 'generic.exe'
+        arch_specific 'bin' $singleNested '64bit' | Should -Not -BeNullOrEmpty
+    }
+
+    It 'falls back to the root when the arch block omits the property' {
+        # regression: an arch block present but silent about 'url'/'hash' shadowed the
+        # root ones, so downloads got a null url (hwinfo, and many other manifests)
+        arch_specific 'url' $partialArch '64bit' | Should -Be 'http://root/f.zip'
+        arch_specific 'hash' $partialArch '64bit' | Should -Be 'abc'
+        arch_specific 'bin' $partialArch '64bit' | Should -Be 'b.exe'
+    }
+
+    It 'emits nothing when the property is absent' {
+        # regression: emitting $null made `@(...)` a one-element array holding $null,
+        # so callers iterated once over nothing (see url_filename)
+        @(arch_specific 'bin' $noBin '64bit').Count | Should -Be 0
+        @(arch_specific 'bin' ('{ "version": "1" }' | ConvertFrom-Json) '64bit').Count | Should -Be 0
+        arch_specific 'bin' $noBin '64bit' | Should -BeNullOrEmpty
+    }
+
+    It 'keeps a multi-value url intact' {
+        $m = '{ "architecture": { "64bit": { "url": ["http://a/f.zip", "http://b/g.zip"] } } }' | ConvertFrom-Json
+        $urls = @(arch_specific 'url' $m '64bit')
+        $urls.Count | Should -Be 2
+        $urls[1] | Should -Be 'http://b/g.zip'
+    }
+
+    It 'handles a hashtable manifest and a null architecture' {
+        # env_add_path/env_rm_path call arch_specific without an architecture
+        $m = @{ 'env_add_path' = @('foo', 'bar') }
+        $paths = @(arch_specific 'env_add_path' $m $null)
+        $paths.Count | Should -Be 2
+        ($paths -join '|') | Should -Be 'foo|bar'
+    }
+}
+
 Describe 'Handle ARM64 and correctly fallback' -Tag 'Scoop' {
     It 'Should return "arm64" if supported' {
         $manifest1 = @{ url = 'test'; architecture = @{ 'arm64' = @{ pre_install = 'test' } } }
@@ -61,6 +126,26 @@ Describe 'Handle ARM64 and correctly fallback' -Tag 'Scoop' {
         Get-SupportedArchitecture $manifest1 'arm64' | Should -Be '32bit'
         Get-SupportedArchitecture $manifest2 'arm64' | Should -Be '32bit'
         Get-SupportedArchitecture $manifest3 'arm64' | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'arch_specific truthiness (documents latent hazard in strict-safe lookup)' -Tag 'Scoop' {
+    # These encode vanilla semantics: a *present* arch-specific prop wins, even when falsy.
+    # The patched arch_specific tests `if (!$the_obj)`, so @() / '' are treated as absent
+    # and fall back to the top-level prop. No manifest in the installed buckets currently
+    # does this (scan 2026-08-20: 0/3596), so failures here are latent, not live.
+    It 'empty arch-specific bin overrides top-level bin' {
+        $m = '{ "bin": "top.exe", "architecture": { "64bit": { "bin": [] } } }' | ConvertFrom-Json
+        @(arch_specific 'bin' $m '64bit') | Should -BeNullOrEmpty
+    }
+    It 'empty-string arch-specific pre_install overrides top-level' {
+        $m = '{ "pre_install": "top", "architecture": { "64bit": { "pre_install": "" } } }' | ConvertFrom-Json
+        arch_specific 'pre_install' $m '64bit' | Should -Be ''
+    }
+    It 'Get-NestedProp tolerates a falsy root object under StrictMode' {
+        # `if ($Object) { $MaybeObject = $Object }` leaves $MaybeObject unassigned for
+        # falsy roots (@(), 0, ''), which StrictMode turns into a throw inside the loop.
+        { & { Set-StrictMode -Version Latest; Get-NestedProp @() @('bin') } } | Should -Not -Throw
     }
 }
 

@@ -543,11 +543,13 @@ function cookie_header($cookies) {
 }
 
 function Get-Encoding($wc) {
-    if ($null -ne $wc.ResponseHeaders -and $wc.ResponseHeaders['Content-Type'] -match 'charset=([^;]*)') {
-        return [System.Text.Encoding]::GetEncoding($Matches[1])
+    $resHeaders = gpod $wc 'ResponseHeaders' @{}
+    $codeName = if ($resHeaders['Content-Type'] -match 'charset=([^;]*)') {
+        $Matches[1]
     } else {
-        return [System.Text.Encoding]::GetEncoding('utf-8')
+        'utf-8'
     }
+    [System.Text.Encoding]::GetEncoding($codeName)
 }
 
 function Get-UserAgent() {

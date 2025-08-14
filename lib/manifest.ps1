@@ -146,12 +146,13 @@ function install_info($app, $version, $global) {
 }
 
 function arch_specific($prop, $manifest, $architecture) {
-    if ($manifest.architecture) {
-        $val = $manifest.architecture.$architecture.$prop
-        if ($val) { return $val } # else fallback to generic prop
+    if (Test-HasProperty $manifest.architecture $architecture) {
+        $the_obj = $manifest.architecture.$architecture
+        # only the property itself is arch-specific, not the whole block
+        if (Test-HasProperty $the_obj $prop) { return $the_obj.$prop }
     }
 
-    if ($manifest.$prop) { return $manifest.$prop }
+    if (Test-HasProperty $manifest $prop) { return $manifest.$prop }
 }
 
 function Get-SupportedArchitecture($manifest, $architecture) {

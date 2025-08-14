@@ -94,7 +94,7 @@ function find_hash_in_textfile([String] $url, [Hashtable] $substitutions, [Strin
     }
 
     # find hash with filename in $hashfile
-    if ($hash.Length -eq 0) {
+    if (-not $hash) {
         $filenameRegex = "([a-fA-F0-9]{32,128})[\x20\t]+.*`$basename(?:\s|$)|`$basename[\x20\t]+.*?([a-fA-F0-9]{32,128})"
         $filenameRegex = substitute $filenameRegex $substitutions $true
         if ($hashfile -match $filenameRegex) {
@@ -216,7 +216,7 @@ function find_hash_in_headers([String] $url) {
 function get_hash_for_app([String] $app, $config, [String] $version, [String] $url, [Hashtable] $substitutions) {
     $hash = $null
 
-    $hashmode = $config.mode
+    $hashmode = gpod $config 'mode' ''
     $originurl = strip_fragment $url
     $basename = [System.Web.HttpUtility]::UrlDecode((url_remote_filename($url)))
 
@@ -244,24 +244,24 @@ function get_hash_for_app([String] $app, $config, [String] $version, [String] $u
     }
 
     $jsonpath = ''
-    if ($config.jp) {
+    if (Test-HasProperty $config 'jp') {
         $jsonpath = $config.jp
         $hashmode = 'json'
     }
-    if ($config.jsonpath) {
+    if (Test-HasProperty $config 'jsonpath') {
         $jsonpath = $config.jsonpath
         $hashmode = 'json'
     }
     $regex = ''
-    if ($config.find) {
+    if (Test-HasProperty $config 'find') {
         $regex = $config.find
     }
-    if ($config.regex) {
+    if (Test-HasProperty $config 'regex') {
         $regex = $config.regex
     }
 
     $xpath = ''
-    if ($config.xpath) {
+    if (Test-HasProperty $config 'xpath') {
         $xpath = $config.xpath
         $hashmode = 'xpath'
     }
@@ -383,7 +383,7 @@ function Update-ManifestProperty {
         foreach ($currentProperty in $Property) {
             if ($currentProperty -eq 'hash') {
                 # Update hash
-                if ($Manifest.hash) {
+                if (Test-HasProperty $Manifest 'hash') {
                     # Global
                     $newURL = substitute $Manifest.autoupdate.url $Substitutions
                     $hashURL = gpod $Manifest.autoupdate 'hash'
@@ -400,7 +400,7 @@ function Update-ManifestProperty {
                         $hasManifestChanged = $hasManifestChanged -or $hasPropertyChanged
                     }
                 }
-            } elseif ($Manifest.$currentProperty -and $Manifest.autoupdate.$currentProperty) {
+            } elseif ((Test-HasProperty $Manifest $currentProperty) -and (Test-HasProperty $Manifest.autoupdate $currentProperty)) {
                 # Update other property (global)
                 $autoupdateProperty = $Manifest.autoupdate.$currentProperty
                 $newValue = substitute $autoupdateProperty $Substitutions
@@ -492,7 +492,7 @@ function Invoke-AutoUpdate {
 
     # update properties
     $updatedProperties = @(@($Manifest.autoupdate.PSObject.Properties.Name) -ne 'architecture')
-    if ($Manifest.autoupdate.architecture) {
+    if (Test-HasProperty $Manifest.autoupdate 'architecture') {
         $updatedProperties += $Manifest.autoupdate.architecture.PSObject.Properties | ForEach-Object { $_.Value.PSObject.Properties.Name }
     }
     if ($updatedProperties -contains 'url') {
@@ -512,14 +512,17 @@ function Invoke-AutoUpdate {
         [System.IO.File]::WriteAllLines($Path, (ConvertToPrettyJson $Manifest))
         # notes
         $note = "`nUpdating note:"
-        if ($Manifest.autoupdate.note) {
+        $hasNote = $false
+        if (Test-HasProperty $Manifest.autoupdate 'note') {
             $note += "`nno-arch: $($Manifest.autoupdate.note)"
             $hasNote = $true
         }
-        if ($Manifest.autoupdate.architecture) {
-            '64bit', '32bit', 'arm64' | ForEach-Object {
-                if ($Manifest.autoupdate.architecture.$_.note) {
-                    $note += "`n$_-arch: $($Manifest.autoupdate.architecture.$_.note)"
+        if (Test-HasProperty $Manifest.autoupdate 'architecture') {
+            ForEach-Object -InputObject $('64bit', '32bit', 'arm64') -Process {
+                $arch_config = gpod $Manifest.autoupdate.architecture $_
+                $maybe_note = gpod $arch_config 'note'
+                if ($maybe_note) {
+                    $note += "`n$_-arch: $maybe_note"
                     $hasNote = $true
                 }
             }
