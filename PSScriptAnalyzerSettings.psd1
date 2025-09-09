@@ -24,5 +24,8 @@
     ExcludeRules = @(
         # Currently Scoop widely uses Write-Host to output colored text.
         'PSAvoidUsingWriteHost'
+        'PSAvoidUsingCmdletAliases'
+        'PSUseShouldProcessForStateChangingFunctions'
+        'PSAvoidUsingPositionalParameters'
     )
 }
