@@ -11,6 +11,21 @@ BeforeDiscovery {
     )
     $repo_files = (Get-ChildItem $TestPath -File -Recurse).FullName |
         Where-Object { $_ -inotmatch $($project_file_exclusions -join '|') }
+
+    # Drop whatever git ignores: IDE folders, the sandboxed modules fetched by
+    # test/bin/init.ps1, tmp dirs, downloaded supporting binaries. They sit in the working
+    # tree but are not project files, so the style rules below must not apply to them.
+    # Degrades to no filtering outside a git checkout.
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        $repo_root = Convert-Path $TestPath
+        $ignored_files = @{}
+        git -C $repo_root ls-files --others --ignored --exclude-standard 2>$null | ForEach-Object {
+            $ignored_files[(Join-Path $repo_root ($_ -replace '/', '\'))] = $true
+        }
+        if ($ignored_files.Count) {
+            $repo_files = $repo_files | Where-Object { -not $ignored_files.ContainsKey($_) }
+        }
+    }
 }
 
 Describe 'Code Syntax' -ForEach @(, $repo_files) -Tag 'File' {
