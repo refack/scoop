@@ -4,6 +4,8 @@
 scoop.sublime-workspace
 test/installer/tmp/*
 test/tmp/*
+test/modules/
 *~
 TestResults.xml
 supporting/sqlite/*
+
