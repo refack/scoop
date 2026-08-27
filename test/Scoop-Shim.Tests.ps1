@@ -302,6 +302,65 @@ Describe 'Get-ShimDefinition' -Tag 'Scoop' {
     }
 }
 
+Describe 'New-ShimFromManifest bin handling' -Tag 'Scoop' {
+    BeforeAll {
+        # Mirrors the pipeline in New-ShimFromManifest. The shape matters: binding an
+        # intermediate pipeline result to a variable re-flattens nested entries and
+        # would hide exactly the regression these tests guard against.
+        function Get-ShimDef($manifest, $arch) {
+            @(arch_specific 'bin' $manifest $arch) | Where-Object { $_ -ne $null } | ForEach-Object {
+                $target, $name, $shimArgs = Get-ShimDefinition $_
+                [PSCustomObject]@{ Target = $target; Name = $name; Args = $shimArgs }
+            }
+        }
+    }
+
+    It 'creates one shim per nested entry' {
+        $m = '{ "architecture": { "64bit": { "bin": [["UX\\AutohotkeyUX.exe", "autohotkey"], ["v2\\AutoHotkey32.exe", "autohotkey32"]] } } }' | ConvertFrom-Json
+        $defs = @(Get-ShimDef $m '64bit')
+        $defs.Count | Should-Be 2
+        $defs[0].Target | Should-Be 'UX\AutohotkeyUX.exe'
+        $defs[0].Name | Should-Be 'autohotkey'
+        $defs[1].Target | Should-Be 'v2\AutoHotkey32.exe'
+        $defs[1].Name | Should-Be 'autohotkey32'
+    }
+
+    It 'handles a single nested entry with arguments' {
+        $m = '{ "bin": [["python.exe", "python3", "-3"]] }' | ConvertFrom-Json
+        $defs = @(Get-ShimDef $m '64bit')
+        $defs.Count | Should-Be 1
+        $defs[0].Target | Should-Be 'python.exe'
+        $defs[0].Name | Should-Be 'python3'
+        $defs[0].Args | Should-Be '-3'
+    }
+
+    It 'derives the name for plain string entries' {
+        $defs = @(Get-ShimDef ('{ "bin": "foo.exe" }' | ConvertFrom-Json) '64bit')
+        $defs.Count | Should-Be 1
+        $defs[0].Target | Should-Be 'foo.exe'
+        $defs[0].Name | Should-Be 'foo'
+        $defs[0].Args | Should-BeNull
+
+        $defs = @(Get-ShimDef ('{ "bin": ["foo.exe", "bar.cmd"] }' | ConvertFrom-Json) '64bit')
+        $defs.Count | Should-Be 2
+        $defs[0].Name | Should-Be 'foo'
+        $defs[1].Name | Should-Be 'bar'
+    }
+
+    It 'mixes string and nested entries' {
+        $m = '{ "bin": ["plain.exe", ["nested.exe", "aliased"]] }' | ConvertFrom-Json
+        $defs = @(Get-ShimDef $m '64bit')
+        $defs.Count | Should-Be 2
+        $defs[0].Name | Should-Be 'plain'
+        $defs[1].Target | Should-Be 'nested.exe'
+        $defs[1].Name | Should-Be 'aliased'
+    }
+
+    It 'creates no shims when bin is absent' {
+        @(Get-ShimDef ('{ "version": "1" }' | ConvertFrom-Json) '64bit').Count | Should-Be 0
+    }
+}
+
 Describe 'shim names with wildcard characters' -Tag 'Scoop', 'Windows' {
     It 'removes a shim literally without touching a wildcard look-alike' {
         $shimdir = Join-Path $TestDrive 'shims'
@@ -327,7 +386,7 @@ Describe 'shim names with wildcard characters' -Tag 'Scoop', 'Windows' {
         { $ErrorActionPreference = 'Stop'; New-ShimFromManifest @{ bin = 'scoop-nonexistent-command' } $dir $false $null } |
             Should-Throw
 
-        $aborted.Message | Should-Be "Can't shim 'scoop-nonexistent-command': File doesn't exist."
+        $aborted.Message | Should-Be "Can't shim 'scoop-nonexistent-command': Target 'scoop-nonexistent-command' doesn't exist."
     }
 
     It 'resolves a bin target from $original_dir when it is not under $dir or on PATH' {
@@ -501,6 +560,27 @@ Describe 'Remove-Shim' -Tag 'Scoop', 'Windows' {
         Remove-Shim 'dupe' $dir | Out-Null
 
         Get-ChildItem $dir | Should-BeCollection -Count 0
+    }
+
+    It 'keeps the .shim config when the exe stub cannot be removed' {
+        # a running shim locks its exe; deleting only the config would leave a broken stub
+        $dir = "$working_dir\locked"
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        'x' | Out-File "$dir\busy.shim" -NoNewline
+        'x' | Out-File "$dir\busy.cmd" -NoNewline
+        'x' | Out-File "$dir\busy.exe" -NoNewline
+
+        $lock = [IO.File]::Open("$dir\busy.exe", 'Open', 'Read', 'None')
+        try {
+            Remove-Shim 'busy' $dir 2>$null 6>$null | Out-Null
+        } finally {
+            $lock.Dispose()
+        }
+
+        Test-Path -LiteralPath "$dir\busy.exe" | Should-BeTrue
+        Test-Path -LiteralPath "$dir\busy.shim" | Should-BeTrue
+        # the other wrappers don't depend on the exe and are still removed
+        Test-Path -LiteralPath "$dir\busy.cmd" | Should-BeFalse
     }
 }
 

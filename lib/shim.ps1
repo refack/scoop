@@ -455,17 +455,18 @@ function New-ShimFromManifest($Manifest, $Dir, $Global, $Arch) {
         Write-Output "Creating shim for '$name'."
 
         if (Test-Path -LiteralPath "$Dir\$target" -PathType leaf) {
-            $bin = "$Dir\$target"
+            $bin_path = "$Dir\$target"
         } elseif (Test-Path -LiteralPath $target -PathType leaf) {
-            $bin = $target
+            $bin_path = $target
         } elseif ($original_dir -and (Test-Path -LiteralPath "$original_dir\$target" -PathType leaf)) {
-            $bin = "$original_dir\$target"
+            $bin_path = "$original_dir\$target"
         } else {
-            $bin = (Get-CommandLiteral $target @('Application', 'ExternalScript')).Source
+            $bin_path = (Get-CommandLiteral $target @('Application', 'ExternalScript')).Source
         }
-        if (!$bin) { abort "Can't shim '$target': File doesn't exist." }
+        if (!$bin_path) { abort "Can't shim '$name': Target '$target' doesn't exist." }
 
-        New-Shim $bin $Global $name (substitute $arg @{ '$dir' = $Dir; '$original_dir' = $original_dir; '$persist_dir' = $persist_dir })
+        $shim_args = substitute $arg @{ '$dir' = $Dir; '$original_dir' = $original_dir; '$persist_dir' = $persist_dir }
+        New-Shim $bin_path $Global $name $shim_args
     }
 }
 
@@ -481,27 +482,49 @@ function rm_shim($name, $shimdir, $app) {
 }
 
 function Remove-Shim($Name, $ShimDir, $App) {
-    '', '.shim', '.cmd', '.ps1' | ForEach-Object {
-        $shimPath = "$ShimDir\$Name$_"
+    # Each shim can be made of up to four component files:
+    #   ''     - extensionless sh-compatible wrapper (only for .bat/.cmd targets)
+    #   .shim  - path config consumed by the .exe stub (only for .exe/.com targets)
+    #   .cmd   - cmd.exe-compatible wrapper
+    #   .ps1   - PowerShell wrapper
+    foreach ($ext in '', '.shim', '.cmd', '.ps1') {
+        $shimPath = "$ShimDir\$Name$ext"
+
+        # When two apps install a shim with the same name the loser's active file is
+        # renamed to "$Name$ext.$losingApp" and kept as a backup. If we're removing
+        # the app that lost that conflict, just delete its backup and leave the
+        # currently-active shim untouched.
         $altShimPath = "$shimPath.$App"
         if ($App -and (Test-Path -LiteralPath $altShimPath -PathType Leaf)) {
-            Write-Output "Removing shim '$Name$_.$App'."
+            Write-Output "Removing shim '$Name$ext.$App'."
             Remove-Item -LiteralPath $altShimPath
         } elseif (Test-Path -LiteralPath $shimPath -PathType Leaf) {
-            Write-Output "Removing shim '$Name$_'."
-            Remove-Item -LiteralPath $shimPath
+            # Check whether any earlier app had its shim backed up when this app overwrote it.
+            # A saved file of another wrapper (tool.ps1.first) carries that wrapper after the name.
+            # The filter's trailing '.*' also matches the bare name, hence the explicit exclusion.
             $shimName = fname $shimPath
             $wrapperTokens = @('shim', 'exe', 'cmd', 'ps1', 'bat')
-            # a saved file of another wrapper (tool.ps1.first) carries that wrapper after the name
             $oldShims = Get-ChildItem -LiteralPath $ShimDir -Filter "$shimName.*" -File |
-                Where-Object { $_.Name.Substring($shimName.Length + 1).Split('.')[0] -notin $wrapperTokens }
-            if ($null -eq $oldShims) {
-                if (($_ -eq '.shim') -and (Test-Path -LiteralPath "$ShimDir\$Name.exe" -PathType Leaf)) {
-                    Write-Output "Removing shim '$Name.exe'."
-                    Remove-Item -LiteralPath "$ShimDir\$Name.exe"
+                Where-Object { $_.Name -ne $shimName -and $_.Name.Substring($shimName.Length + 1).Split('.')[0] -notin $wrapperTokens }
+
+            # The .exe stub and its .shim config are a pair. Remove .exe first, and keep the
+            # .shim if that fails (e.g. the exe is running), so a stub never loses its config.
+            $exePath = "$ShimDir\$Name.exe"
+            if (($ext -eq '.shim') -and ($null -eq $oldShims) -and (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+                Write-Output "Removing shim '$Name.exe'."
+                Remove-Item -LiteralPath $exePath -ErrorAction 'Continue'
+                if (Test-Path -LiteralPath $exePath -PathType Leaf) {
+                    warn "Couldn't remove '$Name.exe', keeping '$Name.shim' so it keeps working."
+                    continue
                 }
-            } else {
-                ($oldShims | Sort-Object -Property LastWriteTimeUtc)[-1] | Rename-Item -NewName { $shimName }
+            }
+
+            Write-Output "Removing shim '$Name$ext'."
+            Remove-Item -LiteralPath $shimPath
+
+            if ($null -ne $oldShims) {
+                # Restore the most-recently-written backup as the new active shim file
+                (@($oldShims) | Sort-Object -Property LastWriteTimeUtc)[-1] | Rename-Item -NewName { $shimName }
             }
         }
     }
