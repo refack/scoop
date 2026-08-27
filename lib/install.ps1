@@ -177,43 +177,65 @@ function shim_def($item) {
     return $item, (strip_ext (fname $item)), $null
 }
 
-function create_shims($manifest, $dir, $global, $arch) {
+function create_shims($manifest, $dir, $is_global, $arch) {
     $shims = @(arch_specific 'bin' $manifest $arch)
     $shims | Where-Object { $_ -ne $null } | ForEach-Object {
         $target, $name, $arg = shim_def $_
         Write-Output "Creating shim for '$name'."
 
         if (Test-Path "$dir\$target" -PathType leaf) {
-            $bin = "$dir\$target"
+            $bin_path = "$dir\$target"
         } elseif (Test-Path $target -PathType leaf) {
-            $bin = $target
+            $bin_path = $target
         } else {
-            $bin = (Get-Command $target).Source
+            $bin_path = (Get-Command $target).Source
         }
-        if (!$bin) { abort "Can't shim '$target': File doesn't exist." }
+        if (!$bin_path) { abort "Can't shim '$name': Target '$target' doesn't exist." }
 
-        shim $bin $global $name (substitute $arg @{ '$dir' = $dir; '$original_dir' = $original_dir; '$persist_dir' = $persist_dir })
+        $shim_args = substitute $arg @{ '$dir' = $dir; '$original_dir' = $original_dir; '$persist_dir' = $persist_dir }
+        shim $bin_path $is_global $name $shim_args
     }
 }
 
 function rm_shim($name, $shimdir, $app) {
-    '', '.shim', '.cmd', '.ps1' | ForEach-Object {
-        $shimPath = "$shimdir\$name$_"
-        $altShimPath = "$shimPath.$app"
-        if ($app -and (Test-Path -Path $altShimPath -PathType Leaf)) {
-            Write-Output "Removing shim '$name$_.$app'."
-            Remove-Item $altShimPath
-        } elseif (Test-Path -Path $shimPath -PathType Leaf) {
-            Write-Output "Removing shim '$name$_'."
-            Remove-Item $shimPath
-            $oldShims = Get-Item -Path "$shimPath.*" -Exclude '*.shim', '*.cmd', '*.ps1'
-            if ($null -eq $oldShims) {
-                if ($_ -eq '.shim') {
-                    Write-Output "Removing shim '$name.exe'."
-                    Remove-Item -Path "$shimdir\$name.exe"
-                }
-            } else {
-                (@($oldShims) | Sort-Object -Property LastWriteTimeUtc)[-1] | Rename-Item -NewName { $_.Name -replace '\.[^.]*$', '' }
+    # Each shim can be made of up to four component files:
+    #   ''     - extensionless sh-compatible wrapper (only for .bat/.cmd targets)
+    #   .shim  - path config consumed by the .exe stub (only for .exe/.com targets)
+    #   .cmd   - cmd.exe-compatible wrapper
+    #   .ps1   - PowerShell wrapper
+    foreach ($ext in '', '.shim', '.cmd', '.ps1') {
+        $shimFile = "$shimdir\$name$ext"
+
+        # When two apps install a shim with the same name the loser's active file is
+        # renamed to "$name$ext.$losingApp" and kept as a backup. If we're removing
+        # the app that lost that conflict, just delete its backup and leave the
+        # currently-active shim untouched.
+        $thisAppsBackup = "$shimFile.$app"
+        if ($app -and (Test-Path -Path $thisAppsBackup -PathType Leaf)) {
+            Write-Output "Removing shim '$name$ext.$app'."
+            Remove-Item $thisAppsBackup
+        } elseif (Test-Path -Path $shimFile -PathType Leaf) {
+            # Check whether any earlier app had its shim backed up when this app
+            # overwrote it. The backup files are named "$name$ext.$thatApp".
+            $backupShims = Get-Item -Path "$shimFile.*" -Exclude '*.shim', '*.cmd', '*.ps1'
+
+            # The .exe stub and its .shim config are a pair. Remove .exe first so
+            # that if it is locked the error propagates before we touch .shim,
+            # preventing a state where the stub exists but its config is gone.
+            if ($ext -eq '.shim' -and $null -eq $backupShims) {
+                Write-Output "Removing shim '$name.exe'."
+                Remove-Item -Path "$shimdir\$name.exe"
+            }
+
+            Write-Output "Removing shim '$name$ext'."
+            Remove-Item $shimFile
+
+            if ($null -ne $backupShims) {
+                # A previous app's shim was backed up when this app overwrote it.
+                # Restore the most-recently-written backup by stripping its trailing
+                # ".$appName" suffix, making it the new active shim file.
+                (@($backupShims) | Sort-Object -Property LastWriteTimeUtc)[-1] |
+                    Rename-Item -NewName { $_.Name -replace '\.[^.]*$', '' }
             }
         }
     }
