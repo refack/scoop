@@ -67,9 +67,9 @@ Describe 'Get-GitHubToken' -Tag 'Scoop' {
         Mock Test-CommandAvailable { $true }
         Mock gh { 'gho_FROM_CLI' }
         $tokenVars | ForEach-Object { [Environment]::SetEnvironmentVariable($_, $null) }
-        # Clear the per-process probe cache
-        $script:ghCliToken = $null
-        $script:ghCliTokenProbed = $false
+        # Clear the per-process probe cache by removing it rather than assigning, so every
+        # test also exercises the uninitialized first-call path that StrictMode rejects
+        Remove-Variable -Name ghCliToken, ghCliTokenProbed -Scope Script -ErrorAction Ignore
     }
 
     It 'should prefer $env:SCOOP_GH_TOKEN over every other source' {
@@ -156,5 +156,20 @@ Describe 'Get-GitHubToken' -Tag 'Scoop' {
         Get-GitHubToken | Should -BeNullOrEmpty
         Get-GitHubToken | Should -BeNullOrEmpty
         Should -Invoke gh -Exactly -Times 1
+    }
+
+    # Callers reached from a user's own session are not shielded by the 'Set-StrictMode -Off'
+    # in bin/scoop.ps1 -- bin/checkver.ps1 and lib/autoupdate.ps1 both call this directly
+    It 'tolerates StrictMode when no token source is set' {
+        # Unset sources are $null, and StrictMode turns the property access that filters
+        # them into an error, which only becomes terminating under $ErrorActionPreference
+        { & { Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; Get-GitHubToken } } | Should -Not -Throw
+    }
+
+    It 'tolerates StrictMode on the ask-gh path' {
+        # The probe cache is read before it is ever assigned
+        Mock get_config { 'ask-gh' }
+        { & { Set-StrictMode -Version Latest; Get-GitHubToken } } | Should -Not -Throw
+        { & { Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; Get-GitHubToken } } | Should -Not -Throw
     }
 }

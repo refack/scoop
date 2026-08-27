@@ -584,19 +584,27 @@ function setup_proxy() {
 }
 
 function Get-GitHubToken {
+    # The probe cache is read before it is ever assigned, which StrictMode rejects
+    if (-not (Get-Variable -Name ghCliTokenProbed -Scope Script -ErrorAction Ignore)) {
+        $script:ghCliTokenProbed = $false
+        $script:ghCliToken = $null
+    }
+
     # 'ask-gh' opts in to the GitHub CLI; it is a sentinel, never a token itself
     $configToken = get_config GH_TOKEN
     $askGh = $configToken -eq 'ask-gh'
     if ($askGh) { $configToken = $null }
 
-    $token = $env:SCOOP_GH_TOKEN, $configToken, $env:GH_TOKEN, $env:GITHUB_TOKEN | Where-Object -Property Length -Value 0 -GT | Select-Object -First 1
+    # Filter on truthiness, not on '.Length': unset sources are $null, and StrictMode
+    # turns property access on those into an error
+    $token = $env:SCOOP_GH_TOKEN, $configToken, $env:GH_TOKEN, $env:GITHUB_TOKEN | Where-Object { $_ } | Select-Object -First 1
     if ($askGh -and !$token -and !$script:ghCliTokenProbed) {
         # Last resort: ask the GitHub CLI, which keeps its token in the system keyring (Windows Credential Manager).
         # Probed at most once per process, since this function runs for every request.
         $script:ghCliTokenProbed = $true
         if (Test-CommandAvailable 'gh') {
             try {
-                $script:ghCliToken = & gh auth token --hostname 'github.com' 2>$null | Where-Object -Property Length -Value 0 -GT | Select-Object -First 1
+                $script:ghCliToken = & gh auth token --hostname 'github.com' 2>$null | Where-Object { $_ } | Select-Object -First 1
             } catch {
                 debug "'gh auth token' failed: $($_.Exception.Message)"
             }
