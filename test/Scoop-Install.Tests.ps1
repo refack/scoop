@@ -62,6 +62,65 @@ Describe 'shim_def' -Tag 'Scoop' {
     }
 }
 
+Describe 'create_shims bin handling' -Tag 'Scoop' {
+    BeforeAll {
+        # Mirrors the pipeline in create_shims. The shape matters: binding an
+        # intermediate pipeline result to a variable re-flattens nested entries and
+        # would hide exactly the regression these tests guard against.
+        function Get-ShimDef($manifest, $arch) {
+            @(arch_specific 'bin' $manifest $arch) | Where-Object { $_ -ne $null } | ForEach-Object {
+                $target, $name, $shimArgs = shim_def $_
+                [PSCustomObject]@{ Target = $target; Name = $name; Args = $shimArgs }
+            }
+        }
+    }
+
+    It 'creates one shim per nested entry' {
+        $m = '{ "architecture": { "64bit": { "bin": [["UX\\AutohotkeyUX.exe", "autohotkey"], ["v2\\AutoHotkey32.exe", "autohotkey32"]] } } }' | ConvertFrom-Json
+        $defs = @(Get-ShimDef $m '64bit')
+        $defs.Count | Should -Be 2
+        $defs[0].Target | Should -Be 'UX\AutohotkeyUX.exe'
+        $defs[0].Name | Should -Be 'autohotkey'
+        $defs[1].Target | Should -Be 'v2\AutoHotkey32.exe'
+        $defs[1].Name | Should -Be 'autohotkey32'
+    }
+
+    It 'handles a single nested entry with arguments' {
+        $m = '{ "bin": [["python.exe", "python3", "-3"]] }' | ConvertFrom-Json
+        $defs = @(Get-ShimDef $m '64bit')
+        $defs.Count | Should -Be 1
+        $defs[0].Target | Should -Be 'python.exe'
+        $defs[0].Name | Should -Be 'python3'
+        $defs[0].Args | Should -Be '-3'
+    }
+
+    It 'derives the name for plain string entries' {
+        $defs = @(Get-ShimDef ('{ "bin": "foo.exe" }' | ConvertFrom-Json) '64bit')
+        $defs.Count | Should -Be 1
+        $defs[0].Target | Should -Be 'foo.exe'
+        $defs[0].Name | Should -Be 'foo'
+        $defs[0].Args | Should -BeNullOrEmpty
+
+        $defs = @(Get-ShimDef ('{ "bin": ["foo.exe", "bar.cmd"] }' | ConvertFrom-Json) '64bit')
+        $defs.Count | Should -Be 2
+        $defs[0].Name | Should -Be 'foo'
+        $defs[1].Name | Should -Be 'bar'
+    }
+
+    It 'mixes string and nested entries' {
+        $m = '{ "bin": ["plain.exe", ["nested.exe", "aliased"]] }' | ConvertFrom-Json
+        $defs = @(Get-ShimDef $m '64bit')
+        $defs.Count | Should -Be 2
+        $defs[0].Name | Should -Be 'plain'
+        $defs[1].Target | Should -Be 'nested.exe'
+        $defs[1].Name | Should -Be 'aliased'
+    }
+
+    It 'creates no shims when bin is absent' {
+        @(Get-ShimDef ('{ "version": "1" }' | ConvertFrom-Json) '64bit').Count | Should -Be 0
+    }
+}
+
 Describe 'persist_def' -Tag 'Scoop' {
     It 'parses string correctly' {
         $source, $target = persist_def 'test'
