@@ -584,8 +584,13 @@ function setup_proxy() {
 }
 
 function Get-GitHubToken {
-    $token = $env:SCOOP_GH_TOKEN, (get_config GH_TOKEN), $env:GH_TOKEN, $env:GITHUB_TOKEN | Where-Object -Property Length -Value 0 -GT | Select-Object -First 1
-    if (!$token -and !$script:ghCliTokenProbed) {
+    # 'ask-gh' opts in to the GitHub CLI; it is a sentinel, never a token itself
+    $configToken = get_config GH_TOKEN
+    $askGh = $configToken -eq 'ask-gh'
+    if ($askGh) { $configToken = $null }
+
+    $token = $env:SCOOP_GH_TOKEN, $configToken, $env:GH_TOKEN, $env:GITHUB_TOKEN | Where-Object -Property Length -Value 0 -GT | Select-Object -First 1
+    if ($askGh -and !$token -and !$script:ghCliTokenProbed) {
         # Last resort: ask the GitHub CLI, which keeps its token in the system keyring (Windows Credential Manager).
         # Probed at most once per process, since this function runs for every request.
         $script:ghCliTokenProbed = $true
@@ -597,7 +602,7 @@ function Get-GitHubToken {
             }
         }
     }
-    if (!$token) { $token = $script:ghCliToken }
+    if ($askGh -and !$token) { $token = $script:ghCliToken }
     return $token
 }
 

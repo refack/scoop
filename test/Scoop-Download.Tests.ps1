@@ -88,6 +88,7 @@ Describe 'Get-GitHubToken' -Tag 'Scoop' {
     }
 
     It 'should use $env:GH_TOKEN and $env:GITHUB_TOKEN before the GitHub CLI' {
+        Mock get_config { 'ask-gh' }
         $env:GITHUB_TOKEN = 'from_github_env'
         Get-GitHubToken | Should -Be 'from_github_env'
 
@@ -97,12 +98,25 @@ Describe 'Get-GitHubToken' -Tag 'Scoop' {
         Should -Invoke gh -Exactly -Times 0
     }
 
-    It 'should fall back to the GitHub CLI when no other source is set' {
+    It 'should not query the GitHub CLI unless gh_token is set to ask-gh' {
+        Get-GitHubToken | Should -BeNullOrEmpty
+        Should -Invoke gh -Exactly -Times 0
+    }
+
+    It 'should never return the ask-gh sentinel as a token' {
+        Mock get_config { 'ask-gh' }
+        Mock Test-CommandAvailable { $false }
+        Get-GitHubToken | Should -BeNullOrEmpty
+    }
+
+    It 'should query the GitHub CLI when gh_token is set to ask-gh' {
+        Mock get_config { 'ask-gh' }
         Get-GitHubToken | Should -Be 'gho_FROM_CLI'
         Should -Invoke gh -Exactly -Times 1
     }
 
     It 'should ask the GitHub CLI for the github.com token' {
+        Mock get_config { 'ask-gh' }
         Get-GitHubToken | Should -Be 'gho_FROM_CLI'
         Should -Invoke gh -Exactly -Times 1 -ParameterFilter {
             ($args -join ' ') -eq 'auth token --hostname github.com'
@@ -110,6 +124,7 @@ Describe 'Get-GitHubToken' -Tag 'Scoop' {
     }
 
     It 'should query the GitHub CLI at most once per process' {
+        Mock get_config { 'ask-gh' }
         Get-GitHubToken | Should -Be 'gho_FROM_CLI'
         Get-GitHubToken | Should -Be 'gho_FROM_CLI'
         Get-GitHubToken | Should -Be 'gho_FROM_CLI'
@@ -117,22 +132,26 @@ Describe 'Get-GitHubToken' -Tag 'Scoop' {
     }
 
     It 'should not query the GitHub CLI if it is not installed' {
+        Mock get_config { 'ask-gh' }
         Mock Test-CommandAvailable { $false }
         Get-GitHubToken | Should -BeNullOrEmpty
         Should -Invoke gh -Exactly -Times 0
     }
 
     It 'should return nothing if the GitHub CLI is not logged in' {
+        Mock get_config { 'ask-gh' }
         Mock gh { }
         Get-GitHubToken | Should -BeNullOrEmpty
     }
 
     It 'should return nothing if the GitHub CLI fails' {
+        Mock get_config { 'ask-gh' }
         Mock gh { throw 'gh: could not read token' }
         Get-GitHubToken | Should -BeNullOrEmpty
     }
 
     It 'should not retry the GitHub CLI after a failed probe' {
+        Mock get_config { 'ask-gh' }
         Mock gh { }
         Get-GitHubToken | Should -BeNullOrEmpty
         Get-GitHubToken | Should -BeNullOrEmpty
