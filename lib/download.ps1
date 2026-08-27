@@ -584,7 +584,21 @@ function setup_proxy() {
 }
 
 function Get-GitHubToken {
-    return $env:SCOOP_GH_TOKEN, (get_config GH_TOKEN), $env:GH_TOKEN, $env:GITHUB_TOKEN | Where-Object -Property Length -Value 0 -GT | Select-Object -First 1
+    $token = $env:SCOOP_GH_TOKEN, (get_config GH_TOKEN), $env:GH_TOKEN, $env:GITHUB_TOKEN | Where-Object -Property Length -Value 0 -GT | Select-Object -First 1
+    if (!$token -and !$script:ghCliTokenProbed) {
+        # Last resort: ask the GitHub CLI, which keeps its token in the system keyring (Windows Credential Manager).
+        # Probed at most once per process, since this function runs for every request.
+        $script:ghCliTokenProbed = $true
+        if (Test-CommandAvailable 'gh') {
+            try {
+                $script:ghCliToken = & gh auth token --hostname 'github.com' 2>$null | Where-Object -Property Length -Value 0 -GT | Select-Object -First 1
+            } catch {
+                debug "'gh auth token' failed: $($_.Exception.Message)"
+            }
+        }
+    }
+    if (!$token) { $token = $script:ghCliToken }
+    return $token
 }
 
 function github_ratelimit_reached {

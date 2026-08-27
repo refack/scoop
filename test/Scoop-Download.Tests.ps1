@@ -47,3 +47,95 @@ Describe 'url_remote_filename' -Tag 'Scoop' {
         url_remote_filename 'http://example.org/foo-v2.zip#/foo.zip' | Should -Be 'foo-v2.zip'
     }
 }
+
+Describe 'Get-GitHubToken' -Tag 'Scoop' {
+    BeforeAll {
+        $tokenVars = 'SCOOP_GH_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'
+        # Stand-in for the GitHub CLI, so a real 'gh' is never invoked and Mock has something to replace
+        function gh { 'gho_realCliMustNotRun' }
+
+        $origEnv = @{}
+        $tokenVars | ForEach-Object { $origEnv[$_] = [Environment]::GetEnvironmentVariable($_) }
+    }
+
+    AfterAll {
+        $origEnv.Keys | ForEach-Object { [Environment]::SetEnvironmentVariable($_, $origEnv[$_]) }
+    }
+
+    BeforeEach {
+        Mock get_config { $null }
+        Mock Test-CommandAvailable { $true }
+        Mock gh { 'gho_FROM_CLI' }
+        $tokenVars | ForEach-Object { [Environment]::SetEnvironmentVariable($_, $null) }
+        # Clear the per-process probe cache
+        $script:ghCliToken = $null
+        $script:ghCliTokenProbed = $false
+    }
+
+    It 'should prefer $env:SCOOP_GH_TOKEN over every other source' {
+        Mock get_config { 'from_config' }
+        $env:SCOOP_GH_TOKEN = 'from_scoop_env'
+        $env:GH_TOKEN = 'from_gh_env'
+        Get-GitHubToken | Should -Be 'from_scoop_env'
+        Should -Invoke gh -Exactly -Times 0
+    }
+
+    It 'should prefer the config over the environment and the GitHub CLI' {
+        Mock get_config { 'from_config' }
+        $env:GH_TOKEN = 'from_gh_env'
+        Get-GitHubToken | Should -Be 'from_config'
+        Should -Invoke gh -Exactly -Times 0
+    }
+
+    It 'should use $env:GH_TOKEN and $env:GITHUB_TOKEN before the GitHub CLI' {
+        $env:GITHUB_TOKEN = 'from_github_env'
+        Get-GitHubToken | Should -Be 'from_github_env'
+
+        $env:GH_TOKEN = 'from_gh_env'
+        Get-GitHubToken | Should -Be 'from_gh_env'
+
+        Should -Invoke gh -Exactly -Times 0
+    }
+
+    It 'should fall back to the GitHub CLI when no other source is set' {
+        Get-GitHubToken | Should -Be 'gho_FROM_CLI'
+        Should -Invoke gh -Exactly -Times 1
+    }
+
+    It 'should ask the GitHub CLI for the github.com token' {
+        Get-GitHubToken | Should -Be 'gho_FROM_CLI'
+        Should -Invoke gh -Exactly -Times 1 -ParameterFilter {
+            ($args -join ' ') -eq 'auth token --hostname github.com'
+        }
+    }
+
+    It 'should query the GitHub CLI at most once per process' {
+        Get-GitHubToken | Should -Be 'gho_FROM_CLI'
+        Get-GitHubToken | Should -Be 'gho_FROM_CLI'
+        Get-GitHubToken | Should -Be 'gho_FROM_CLI'
+        Should -Invoke gh -Exactly -Times 1
+    }
+
+    It 'should not query the GitHub CLI if it is not installed' {
+        Mock Test-CommandAvailable { $false }
+        Get-GitHubToken | Should -BeNullOrEmpty
+        Should -Invoke gh -Exactly -Times 0
+    }
+
+    It 'should return nothing if the GitHub CLI is not logged in' {
+        Mock gh { }
+        Get-GitHubToken | Should -BeNullOrEmpty
+    }
+
+    It 'should return nothing if the GitHub CLI fails' {
+        Mock gh { throw 'gh: could not read token' }
+        Get-GitHubToken | Should -BeNullOrEmpty
+    }
+
+    It 'should not retry the GitHub CLI after a failed probe' {
+        Mock gh { }
+        Get-GitHubToken | Should -BeNullOrEmpty
+        Get-GitHubToken | Should -BeNullOrEmpty
+        Should -Invoke gh -Exactly -Times 1
+    }
+}
