@@ -172,38 +172,158 @@ function Get-SupportedArchitecture($manifest, $architecture) {
     }
 }
 
+function Find-HistoricalManifestInCache($app, $bucket, $requestedVersion) {
+    if (!(get_config USE_SQLITE_CACHE)) {
+        return $null
+    }
+
+    if (!$bucket) {
+        return $null
+    }
+
+    if (!(Get-Command 'Get-ScoopDBItem' -ErrorAction SilentlyContinue)) {
+        . "$PSScriptRoot\database.ps1"
+    }
+
+    $dbResult = Get-ScoopDBItem -Name $app -Bucket $bucket -Version $requestedVersion
+
+    if ($dbResult.Rows.Count -eq 0) { return $null }
+
+    $manifestText = $dbResult.Rows[0]['manifest']
+    if ([string]::IsNullOrWhiteSpace($manifestText)) { return $null }
+
+    $manifestObj = $null
+    try { $manifestObj = $manifestText | ConvertFrom-Json -ErrorAction Stop } catch {}
+    $manifestVersion = if ($manifestObj -and $manifestObj.version) { $manifestObj.version } else { $requestedVersion }
+
+    return @{ ManifestText = $manifestText; version = $manifestVersion; source = "sqlite_exact_match" }
+}
+
+function Find-HistoricalManifestInGit($app, $bucket, $requestedVersion) {
+    if (!(get_config USE_GIT_HISTORY $true)) {
+        return $null
+    }
+
+    if (!$bucket) {
+        return $null
+    }
+
+    $bucketDir = Find-BucketDirectory $bucket -Root
+    if (!(Test-Path "$bucketDir\.git")) {
+        warn "Bucket '$bucket' is not a git repository. Cannot search historical versions."
+        return $null
+    }
+
+    $innerBucketDir = Find-BucketDirectory $bucket
+    if (-not (Test-Path $innerBucketDir -PathType Container)) {
+        warn "Could not find inner bucket directory for '$bucket' at '$innerBucketDir'."
+        return $null
+    }
+    $relativeManifestPath = (Get-RelativePath $bucketDir (Join-Path $innerBucketDir "$app.json")) -replace '\\', '/'
+
+    try {
+        # HEAD fast-path: skip pickaxe if HEAD already has the requested version.
+        $headContent = Invoke-Git -Path $bucketDir -ArgumentList @('show', "HEAD`:$relativeManifestPath") 2>$null
+        if ($headContent) {
+            if ($headContent -is [Array]) { $headContent = $headContent -join "`n" }
+            try {
+                $headObj = $headContent | ConvertFrom-Json -ErrorAction Stop
+                if ($headObj -and $headObj.version -eq $requestedVersion) {
+                    return @{ ManifestText = $headContent; version = $requestedVersion; source = "git_manifest:HEAD" }
+                }
+            } catch {}
+        }
+
+        # Pickaxe. Regex avoids literal '"' because Windows command line strips
+        # them before git sees the arg; '.' wildcards stand in for the JSON quotes.
+        $pattern = 'version.: .' + [regex]::Escape($requestedVersion)
+        $commits = @()
+        $outG = Invoke-Git -Path $bucketDir -ArgumentList @('log', '--follow', '-n', '1', '--format=%H', '-G', $pattern, '--', $relativeManifestPath)
+        if ($outG) { $commits = @($outG | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) }
+
+        if ($commits.Count -eq 0) {
+            # -S literal fallback (same Windows quoting caveat).
+            $searchLiteral = 'version: ' + $requestedVersion
+            $outS = Invoke-Git -Path $bucketDir -ArgumentList @('log', '--follow', '-n', '1', '--format=%H', '-S', $searchLiteral, '--', $relativeManifestPath)
+            if ($outS) { $commits = @($outS | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) }
+        }
+
+        if ($commits.Count -eq 0) { return $null }
+
+        $h = $commits[0]
+        foreach ($spec in @("$h^", "$h")) {
+            $content = Invoke-Git -Path $bucketDir -ArgumentList @('show', "$spec`:$relativeManifestPath") 2>$null
+            if (-not $content) { continue }
+            if ($content -is [Array]) { $content = $content -join "`n" }
+            try {
+                $obj = $content | ConvertFrom-Json -ErrorAction Stop
+            } catch { continue }
+            if ($obj -and $obj.version -eq $requestedVersion) {
+                return @{ ManifestText = $content; version = $requestedVersion; source = "git_manifest:$spec" }
+            }
+        }
+        return $null
+    } catch { return $null }
+}
+
+function Find-HistoricalManifest($app, $bucket, $version) {
+    # Orchestrates historical manifest lookup using available providers (DB → Git)
+    $result = $null
+
+    if (get_config USE_SQLITE_CACHE) {
+        $result = Find-HistoricalManifestInCache $app $bucket $version
+        if ($result) {
+            if ($result.ManifestText) {
+                $path = Write-ManifestToUserCache -App $app -ManifestText $result.ManifestText
+                return @{ path = $path; version = $result.version; source = $result.source }
+            }
+            return $result
+        }
+    }
+
+    if (get_config USE_GIT_HISTORY $true) {
+        $result = Find-HistoricalManifestInGit $app $bucket $version
+        if ($result) {
+            if ($result.ManifestText) {
+                $path = Write-ManifestToUserCache -App $app -ManifestText $result.ManifestText
+                return @{ path = $path; version = $result.version; source = $result.source }
+            }
+            return $result
+        }
+    }
+    return $null
+}
+
+
 function generate_user_manifest($app, $bucket, $version) {
     # 'autoupdate.ps1' 'buckets.ps1' 'manifest.ps1'
     $app, $manifest, $bucket, $null = Get-Manifest "$bucket/$app"
     if ("$($manifest.version)" -eq "$version") {
         return manifest_path $app $bucket
     }
-    warn "Given version ($version) does not match manifest ($($manifest.version))"
-    warn "Attempting to generate manifest for '$app' ($version)"
+
+    # Try historical providers via orchestrator
+    info "Attempting to find historical manifest for '$app' ($version)"
+    $historicalResult = Find-HistoricalManifest $app $bucket $version
+    if ($historicalResult) { return $historicalResult.path }
+
+    # No historical manifest; try autoupdate if available
+    if (!($manifest.autoupdate)) {
+        abort "Could not find manifest for '$app@$version' and no autoupdate is available"
+    } else {
+        warn "No historical manifest found for '$app@$version'; attempting autoupdate"
+    }
 
     ensure (usermanifestsdir) | Out-Null
     $manifest_path = "$(usermanifestsdir)\$app.json"
-
-    if (get_config USE_SQLITE_CACHE) {
-        $cached_manifest = (Get-ScoopDBItem -Name $app -Bucket $bucket -Version $version).manifest
-        if ($cached_manifest) {
-            $cached_manifest | Out-UTF8File $manifest_path
-            return $manifest_path
-        }
-    }
-
-    if (!($manifest.autoupdate)) {
-        abort "'$app' does not have autoupdate capability`r`ncouldn't find manifest for '$app@$version'"
-    }
 
     try {
         Invoke-AutoUpdate $app $manifest_path $manifest $version $(@{ })
         return $manifest_path
     } catch {
-        Write-Host -ForegroundColor DarkRed "Could not install $app@$version"
+        warn "Autoupdate failed for '$app@$version'"
+        return $null
     }
-
-    return $null
 }
 
 function url($manifest, $arch) { arch_specific 'url' $manifest $arch }
@@ -212,3 +332,15 @@ function uninstaller($manifest, $arch) { arch_specific 'uninstaller' $manifest $
 function hash($manifest, $arch) { arch_specific 'hash' $manifest $arch }
 function extract_dir($manifest, $arch) { arch_specific 'extract_dir' $manifest $arch }
 function extract_to($manifest, $arch) { arch_specific 'extract_to' $manifest $arch }
+
+# Writes manifest text to usermanifestsdir
+function Write-ManifestToUserCache {
+    param(
+        [Parameter(Mandatory = $true, Position = 0)][string]$App,
+        [Parameter(Mandatory = $true, Position = 1)][string]$ManifestText
+    )
+    ensure (usermanifestsdir) | Out-Null
+    $tempManifestPath = "$(usermanifestsdir)\$App.json"
+    $ManifestText | Out-UTF8File -FilePath $tempManifestPath
+    return $tempManifestPath
+}

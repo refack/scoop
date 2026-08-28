@@ -647,8 +647,29 @@ function friendly_path($path) {
         return $path -replace ([Regex]::Escape($h)), '~\'
     }
 }
+
+# Returns the relative path from $from to $to, or $to unchanged when
+# $to is not under $from.
+function Get-RelativePath($from, $to) {
+    if (-not (is_in_dir $from $to)) {
+        return $to
+    }
+
+    if ($PSVersionTable.PSVersion.Major -ge 6) {
+        try {
+            return [System.IO.Path]::GetRelativePath($from, $to)
+        } catch {}
+    }
+
+    return ($to.Substring($from.Length).TrimStart('\', '/') -replace '/', '\')
+}
 function is_local($path) {
     ($path -notmatch '^https?://') -and (Test-Path $path)
+}
+
+# True if $check equals $dir or sits under $dir.
+function is_in_dir($dir, $check) {
+    $check -match "^$([regex]::Escape("$dir"))([/\\]|$)"
 }
 
 # operations
