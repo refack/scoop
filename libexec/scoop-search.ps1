@@ -61,7 +61,7 @@ function search_bucket($bucket, $query) {
         $content = [System.IO.File]::ReadAllText($filepath)
         # gh-6284: fast fail if the query does not appear in the manifest
         if ($content -notmatch $query -and $name -notmatch $query) { return }
-        
+
         $json = try {
             [System.Text.Json.JsonDocument]::Parse($content)
         } catch {
