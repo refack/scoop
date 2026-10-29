@@ -535,6 +535,157 @@ Describe 'Show-DeprecatedWarning' -Tag 'Scoop' {
     }
 }
 
+Describe 'Invoke-GitParallel' -Tag 'Scoop' {
+    BeforeAll {
+        $repoA = Join-Path $TestDrive 'repo a'
+        $repoB = Join-Path $TestDrive 'repo-b'
+        $notRepo = Join-Path $TestDrive 'not-a-repo'
+        $repoA, $repoB, $notRepo | ForEach-Object { New-Item -ItemType Directory -Path $_ | Out-Null }
+        $repoA, $repoB | ForEach-Object { git init -q $_ }
+        # keep git from discovering an enclosing repository above $TestDrive
+        $env:GIT_CEILING_DIRECTORIES = $TestDrive
+    }
+    AfterAll {
+        Remove-Item Env:\GIT_CEILING_DIRECTORIES -ErrorAction Ignore
+    }
+
+    It 'returns one result per directory in input order, with exit codes' {
+        $res = @(Invoke-GitParallel -Path $repoA, $notRepo, $repoB -ArgumentList @('rev-parse', '--is-inside-work-tree'))
+        $res.Count | Should-Be 3
+        $res.Path | Should-BeCollection @($repoA, $notRepo, $repoB)
+        $res[0].ExitCode | Should-Be 0
+        $res[0].Output | Should-Be 'true'
+        $res[1].ExitCode | Should-NotBe 0
+        ($res[1].ErrorOutput -join "`n") | Should-MatchString 'not a git repository'
+        $res[2].ExitCode | Should-Be 0
+    }
+
+    It 'processes every directory when throttled to one' {
+        $dirs = $repoA, $repoB, $repoA, $repoB
+        $res = @(Invoke-GitParallel -Path $dirs -ArgumentList @('rev-parse', '--is-inside-work-tree') -ThrottleLimit 1)
+        $res.Count | Should-Be 4
+        $res.ExitCode | Should-BeCollection @(0, 0, 0, 0)
+    }
+
+    It 'passes arguments containing spaces, quotes and trailing backslashes intact' {
+        $res = Invoke-GitParallel -Path $repoA -ArgumentList @('rev-parse', '--sq-quote', 'a b', 'c"d', 'e f\')
+        $res.Output | Should-Be " 'a b' 'c`"d' 'e f\'"
+    }
+}
+
+Describe 'Update-GitBranch' -Tag 'Scoop' {
+    BeforeAll {
+        # isolate from the user's git config (signing, pull.rebase, hooks, ...)
+        $env:GIT_CEILING_DIRECTORIES = $TestDrive
+        $env:GIT_CONFIG_NOSYSTEM = '1'
+        $env:GIT_CONFIG_GLOBAL = Join-Path $TestDrive 'gitconfig'
+        Set-Content -Path $env:GIT_CONFIG_GLOBAL -Value "[user]`n`tname = test`n`temail = test@example.com"
+
+        function Set-TestCommit($Repo, $File, $Content) {
+            Set-Content -LiteralPath (Join-Path $Repo $File) -Value $Content
+            git -C $Repo add -A
+            git -C $Repo commit -q -m "edit $File"
+        }
+        # origin with app.json + other.json, and a clone tracking it
+        function New-TestClone($Name) {
+            $origin = Join-Path $TestDrive "$Name-origin"
+            $clone = Join-Path $TestDrive $Name
+            git init -q -b master $origin
+            Set-TestCommit $origin 'app.json' 'v1'
+            Set-TestCommit $origin 'other.json' 'x'
+            git clone -q $origin $clone
+            return $origin, $clone
+        }
+        function Get-Head($Repo, $Rev = 'HEAD') { git -C $Repo rev-parse $Rev }
+    }
+    AfterAll {
+        'GIT_CEILING_DIRECTORIES', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL' | ForEach-Object { Remove-Item "Env:\$_" -ErrorAction Ignore }
+    }
+
+    It 'fast-forwards when there are no local commits' {
+        $origin, $clone = New-TestClone 'ff'
+        Set-TestCommit $origin 'app.json' 'v2'
+        git -C $clone fetch -q
+
+        $res = Update-GitBranch -Path $clone
+        $res.Status | Should-Be 'FastForward'
+        $res.NewHead | Should-Be (Get-Head $origin)
+        $res.Base | Should-Be $res.OldHead
+        Get-Content (Join-Path $clone 'app.json') | Should-Be 'v2'
+    }
+
+    It 'rebases a local tweak commit onto upstream' {
+        $origin, $clone = New-TestClone 'rebase'
+        Set-TestCommit $clone 'other.json' 'my tweak'
+        $tweakBase = Get-Head $clone 'HEAD~1'
+        Set-TestCommit $origin 'app.json' 'v2'
+        git -C $clone fetch -q
+
+        $res = Update-GitBranch -Path $clone
+        $res.Status | Should-Be 'Rebased'
+        $res.Base | Should-Be $tweakBase
+        $res.Upstream | Should-Be (Get-Head $origin)
+        Get-Head $clone 'HEAD~1' | Should-Be (Get-Head $origin)
+        Get-Content (Join-Path $clone 'app.json') | Should-Be 'v2'
+        Get-Content (Join-Path $clone 'other.json') | Should-Be 'my tweak'
+    }
+
+    It 'aborts on conflict and leaves the branch untouched' {
+        $origin, $clone = New-TestClone 'conflict'
+        Set-TestCommit $clone 'app.json' 'my tweak'
+        $before = Get-Head $clone
+        Set-TestCommit $origin 'app.json' 'v2'
+        git -C $clone fetch -q
+
+        $res = Update-GitBranch -Path $clone
+        $res.Status | Should-Be 'Conflict'
+        $res.Conflicts | Should-Be 'app.json'
+        $res.NewHead | Should-Be $before
+        Get-Head $clone | Should-Be $before
+        Test-Path (Join-Path $clone '.git\rebase-merge') | Should-BeFalse
+        git -C $clone status --porcelain | Should-BeNull
+    }
+
+    It 'keeps uncommitted changes across a rebase' {
+        $origin, $clone = New-TestClone 'dirty'
+        Set-TestCommit $clone 'other.json' 'my tweak'
+        Add-Content -LiteralPath (Join-Path $clone 'other.json') -Value 'wip'
+        Set-TestCommit $origin 'app.json' 'v2'
+        git -C $clone fetch -q
+
+        (Update-GitBranch -Path $clone).Status | Should-Be 'Rebased'
+        Get-Content (Join-Path $clone 'other.json') | Should-BeCollection @('my tweak', 'wip')
+    }
+
+    It 'reports up to date when only local commits are ahead' {
+        $null, $clone = New-TestClone 'ahead'
+        Set-TestCommit $clone 'other.json' 'my tweak'
+        $before = Get-Head $clone
+
+        $res = Update-GitBranch -Path $clone
+        $res.Status | Should-Be 'UpToDate'
+        $res.NewHead | Should-Be $before
+    }
+
+    It 'does not touch a rebase the user left in progress' {
+        $origin, $clone = New-TestClone 'busy'
+        Set-TestCommit $clone 'app.json' 'my tweak'
+        Set-TestCommit $origin 'app.json' 'v2'
+        git -C $clone fetch -q
+        git -C $clone rebase -q '@{upstream}' *> $null
+
+        (Update-GitBranch -Path $clone).Status | Should-Be 'Busy'
+        Test-Path (Join-Path $clone '.git\rebase-merge') | Should-BeTrue
+    }
+
+    It 'reports a branch without upstream' {
+        $null, $clone = New-TestClone 'noupstream'
+        git -C $clone checkout -q -b local-only
+
+        (Update-GitBranch -Path $clone).Status | Should-Be 'NoUpstream'
+    }
+}
+
 Describe 'app_status' -Tag 'Scoop' {
     BeforeAll {
         . "$PSScriptRoot\..\lib\manifest.ps1" # 'install_info' 'Find-AppBucket'
