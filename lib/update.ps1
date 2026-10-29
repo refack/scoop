@@ -110,93 +110,6 @@ function Sync-Scoop {
     }
 }
 
-function Parse-GitPull {
-    # example ret:
-    #
-    # POST git-upload-pack (226 bytes)
-    # From https://github.com/ScoopInstaller/Main
-    # = [up to date]          master     -> origin/master
-    # = [up to date]          fix-test   -> origin/fix-test
-    # Updating 5cf69323d..3d40cf562
-    # Fast-forward
-    # bucket/azure-cli.json            |  6 +++---
-    # bucket/azure-ps.json             | 10 +++++-----
-    # bucket/balena-cli.json           |  6 ------
-    # bucket/terragrunt.json           | 10 +++++-----
-    # bucket/tflint.json               | 10 +++++-----
-    # bucket/tinymist.json             | 34 ++++++++++++++++++++++++++++++++++
-    # bucket/traefik.json              | 14 +++++++-------
-
-    param(
-        [string[]] $GitOutput = ""
-    )
-
-    $hashRange = $null
-    $files = [System.Collections.Generic.List[object]]::new()
-    # Use a dictionary to handle multiple lines referring to the same file (e.g. diffstat and rename line)
-    $fileInfo = [ordered]@{}
-
-    # --- 1. Find Hash Range ---
-    $hashLine = $GitOutput | Select-String -Pattern '^Updating ([\da-f\.]+\.\.[\da-f\.]+)'
-    if ($hashLine) {
-        $hashRange = $hashLine.Matches[0].Groups[1].Value
-    }
-
-    # --- 2. Parse File Statuses ---
-    # Process explicit mode changes first, as they are more reliable
-    foreach ($line in $GitOutput) {
-        if ($line -match '^\s*create mode \d+ (.+)') {
-            $filePath = $matches[1].Trim()
-            $fileInfo[$filePath] = @{ Path = $filePath; Status = 'added' }
-        }
-        elseif ($line -match '^\s*delete mode \d+ (.+)') {
-            $filePath = $matches[1].Trim()
-            $fileInfo[$filePath] = @{ Path = $filePath; Status = 'deleted' }
-        }
-        elseif ($line -match '^\s*rename (.+?)(?: => (.+))? \(([\d%]+)\)') {
-            $renamePart = $matches[1].Trim()
-            $toPart = $matches[2]
-
-            if ($renamePart -match '^{(.+?)\s+=>\s+(.+?)}/(.+)') {
-                $oldDir = $matches[1]
-                $newDir = $matches[2]
-                $file = $matches[3]
-                $oldPath = Join-Path $oldDir $file
-                $newPath = Join-Path $newDir $file
-                $fileInfo[$newPath] = @{ Path = $newPath; Status = 'renamed'; OldPath = $oldPath }
-            } elseif ($toPart) {
-                $oldPath = $renamePart
-                $newPath = $toPart.Trim()
-                $fileInfo[$newPath] = @{ Path = $newPath; Status = 'renamed'; OldPath = $oldPath }
-            }
-        }
-    }
-
-    # Process diffstat lines for files not already identified by explicit mode changes
-    foreach ($line in $GitOutput) {
-        if ($line -match '^\s*(?<path>.+?)\s+\|\s+\d+\s+(?<changes>[+\-]+)$') {
-            $filePath = $matches.path.Trim()
-            if ($fileInfo.Contains($filePath)) { continue }
-
-            $changes = $matches.changes
-            if ($changes.Contains('+') -and -not $changes.Contains('-')) {
-                $fileInfo[$filePath] = @{ Path = $filePath; Status = 'added' }
-            } elseif ($changes.Contains('-') -and -not $changes.Contains('+')) {
-                $fileInfo[$filePath] = @{ Path = $filePath; Status = 'deleted' }
-            } else {
-                $fileInfo[$filePath] = @{ Path = $filePath; Status = 'changed' }
-            }
-        }
-    }
-
-    # Convert the dictionary to a list of PSCustomObjects
-    foreach ($key in $fileInfo.Keys) {
-        $files.Add([PSCustomObject]$fileInfo[$key])
-    }
-
-    return $hashRange, $files
-}
-
 function Sync-Bucket {
     Param (
         [Switch]$Log
@@ -227,26 +140,73 @@ function Sync-Bucket {
         return $ret
     }
 
-    $retList = $buckets | Where-Object is_git | ForEach-Object {
+    $gitBuckets = @($buckets | Where-Object is_git)
+    if (!$gitBuckets) { return }
+
+    # Network-bound fetches run concurrently; merges below stay sequential so output is ordered
+    $fetchResults = @{}
+    $fetchJobs = [Math]::Min(64, [Math]::Max(1, [int](get_config GIT_FETCH_JOBS 8)))
+    Invoke-GitParallel -Path $gitBuckets.path -ArgumentList @('fetch', '--quiet') -ThrottleLimit $fetchJobs | ForEach-Object {
+        $fetchResults[$_.Path] = $_
+    }
+
+    $retList = $gitBuckets | ForEach-Object {
         $bucketName = $_.name
         $bucketLoc = $_.path
-        # $bucketLocInner = Find-BucketDirectory $bucketName
+        $bucketLocInner = Find-BucketDirectory $bucketName
+
+        $fetch = $fetchResults[$bucketLoc]
+        if ($fetch.ExitCode -ne 0) {
+            warn "Failed to fetch bucket '$bucketName' ($bucketLoc). Skipped."
+            $fetch.ErrorOutput | ForEach-Object { Write-Host "      $_" -f DarkGray }
+            return
+        }
 
         Write-Host "Updating Bucket $bucketName ($bucketLoc)"
 
-        $git_pull_ret = Invoke-Git -Path $bucketLoc -ArgumentList @('pull', '--verbose')
-        $hashRange, $affectedFiles = Parse-GitPull $git_pull_ret
+        # Fast-forward, or rebase local commits (e.g. personal tweaks) onto upstream
+        $sync = Update-GitBranch -Path $bucketLoc
+        switch ($sync.Status) {
+            'Rebased' { info "Rebased local commits of '$bucketName' onto upstream." }
+            'Conflict' {
+                warn "Local commits of '$bucketName' conflict with upstream. Rebase aborted, bucket not updated."
+                $sync.Conflicts | ForEach-Object { Write-Host "      $_" -f DarkGray }
+                Write-Host "      Resolve manually: git -C `"$bucketLoc`" rebase '@{upstream}'" -f DarkGray
+            }
+            'Failed' {
+                warn "Failed to update bucket '$bucketName'. Bucket not updated."
+                $sync.Output | ForEach-Object { Write-Host "      $_" -f DarkGray }
+            }
+            'Busy' { warn "'$bucketName' has a rebase or merge in progress. Skipped." }
+            'NoUpstream' { warn "'$bucketName' has no upstream branch to update from. Skipped." }
+        }
+        if ($sync.NewHead -eq $sync.OldHead) { return }
 
-        if ($Log -and $hashRange) {
-            Invoke-GitLog -Path $bucketLoc -Name $bucketName -CommitHash $hashRange
+        if ($Log) {
+            # Only the incoming upstream commits, not the rebased local ones.
+            # Out-Host: this block's output is collected as the list of changed manifests
+            Invoke-GitLog -Path $bucketLoc -Name $bucketName -CommitHash $sync.Base -To $sync.Upstream | Out-Host
         }
 
-        return $affectedFiles
+        Invoke-Git -Path $bucketLoc -ArgumentList @('-c', 'core.quotePath=false', 'diff', '--name-status', '--no-renames', $sync.OldHead, $sync.NewHead) | ForEach-Object {
+            $status, $file = $_ -split '\t', 2
+            [PSCustomObject]@{
+                Status   = $status
+                Bucket   = $bucketName
+                FullPath = [System.IO.Path]::GetFullPath((Join-Path $bucketLoc $file))
+            }
+        } | Where-Object { $_.FullPath -like "$bucketLocInner\*.json" }
     }
     if ((get_config USE_SQLITE_CACHE) -and $retList) {
         info 'Updating cache...'
-        Set-ScoopDB -Path $updatedFiles
-        $removedFiles | Remove-ScoopDBItem
+        $gone, $present = @($retList).Where({ $_.Status -eq 'D' }, 'Split')
+        # Set-ScoopDB with no paths rebuilds the whole cache, so only call it when needed
+        if ($present) { Set-ScoopDB -Path $present.FullPath }
+        if ($gone) {
+            $gone | ForEach-Object {
+                [PSCustomObject]@{ Name = [System.IO.Path]::GetFileNameWithoutExtension($_.FullPath); Bucket = $_.Bucket }
+            } | Remove-ScoopDBItem
+        }
     }
 }
 

@@ -276,6 +276,148 @@ function Invoke-Git {
     return & $git @ArgumentList
 }
 
+function Invoke-GitParallel {
+    # Runs the same git command in several repositories concurrently.
+    # Uses raw processes (not jobs/runspaces) so it works on both PowerShell 5.1 and 7.
+    # Returns one object per directory, in input order: Path, ExitCode, Output, ErrorOutput
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [Alias('PSPath', 'Path')]
+        [String[]]
+        $WorkingDirectory,
+        [Parameter(Mandatory = $true, Position = 1)]
+        [Alias('Args')]
+        [String[]]
+        $ArgumentList,
+        [ValidateRange(1, 64)]
+        [Int]
+        $ThrottleLimit = 8
+    )
+
+    $proxy = get_config PROXY ''
+    if ($proxy -and $proxy.StartsWith('currentuser@')) {
+        $proxy = $proxy.Replace('currentuser@', ':@')
+    }
+    $git = Get-HelperPath -Helper Git | Select-Object -First 1
+
+    # .NET Framework has no ProcessStartInfo.ArgumentList, so quote per MSVCRT rules
+    $quote = {
+        param($a)
+        if ($a -and $a -notmatch '[\s"]') { return $a }
+        '"' + (($a -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"'
+    }
+
+    $queue = [System.Collections.Generic.Queue[String]]::new([String[]]$WorkingDirectory)
+    $running = [System.Collections.Generic.Queue[Object]]::new()
+    while ($queue.Count -or $running.Count) {
+        if ($queue.Count -and $running.Count -lt $ThrottleLimit) {
+            $dir = $queue.Dequeue()
+            $psi = [System.Diagnostics.ProcessStartInfo]::new($git)
+            $psi.Arguments = (@('-C', $dir) + $ArgumentList | ForEach-Object { & $quote $_ }) -join ' '
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+            $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+            if ($proxy -and $proxy -ne 'none') {
+                $psi.EnvironmentVariables['HTTPS_PROXY'] = $proxy
+                $psi.EnvironmentVariables['HTTP_PROXY'] = $proxy
+            }
+            $p = [System.Diagnostics.Process]::Start($psi)
+            # Drain both pipes asynchronously, otherwise a full buffer deadlocks the child
+            $running.Enqueue(@{
+                    Path   = $dir
+                    Proc   = $p
+                    Stdout = $p.StandardOutput.ReadToEndAsync()
+                    Stderr = $p.StandardError.ReadToEndAsync()
+                })
+            continue
+        }
+
+        $job = $running.Dequeue()
+        $job.Proc.WaitForExit()
+        [PSCustomObject]@{
+            Path        = $job.Path
+            ExitCode    = $job.Proc.ExitCode
+            Output      = @($job.Stdout.Result -split '\r?\n' | Where-Object { $_ })
+            ErrorOutput = @($job.Stderr.Result -split '\r?\n' | Where-Object { $_ })
+        }
+        $job.Proc.Dispose()
+    }
+}
+
+function Update-GitBranch {
+    # Brings the checked-out branch up to its (already fetched) upstream while keeping local commits:
+    # fast-forwards when there are none, otherwise rebases them on top. If the rebase stops for any
+    # reason it is aborted, so the branch is either fully updated or left exactly as it was.
+    # Status: UpToDate | FastForward | Rebased | Conflict | Failed | Busy | NoUpstream
+    # Log the upstream changes with 'Base..Upstream'; diff the working tree with 'OldHead..NewHead'.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [Alias('PSPath', 'Path')]
+        [String]
+        $WorkingDirectory
+    )
+
+    $git = { Invoke-Git -Path $WorkingDirectory -ArgumentList $args[0] 2>&1 | ForEach-Object { "$_" } }
+    $isBusy = {
+        foreach ($marker in 'rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD') {
+            $markerPath = & $git @('rev-parse', '--git-path', $marker)
+            if (![System.IO.Path]::IsPathRooted($markerPath)) { $markerPath = Join-Path $WorkingDirectory $markerPath }
+            if (Test-Path -LiteralPath $markerPath) { return $true }
+        }
+        return $false
+    }
+
+    $ret = [PSCustomObject]@{
+        Status    = $null
+        OldHead   = & $git @('rev-parse', 'HEAD')
+        NewHead   = $null
+        Base      = $null
+        Upstream  = $null
+        Conflicts = @()
+        Output    = @()
+    }
+    $ret.NewHead = $ret.OldHead
+
+    # Never touch an operation the user left half-done (e.g. a conflict they are resolving)
+    if (& $isBusy) {
+        $ret.Status = 'Busy'
+        return $ret
+    }
+    $ret.Upstream = & $git @('rev-parse', '--verify', '--quiet', '@{upstream}')
+    if ($LASTEXITCODE -ne 0) {
+        $ret.Upstream = $null
+        $ret.Status = 'NoUpstream'
+        return $ret
+    }
+    $ret.Base = & $git @('merge-base', 'HEAD', $ret.Upstream)
+
+    if ($ret.Base -eq $ret.Upstream) {
+        # Nothing new upstream (possibly with local commits ahead)
+        $ret.Status = 'UpToDate'
+        return $ret
+    }
+    if ($ret.Base -eq $ret.OldHead) {
+        $ret.Output = @(& $git @('merge', '--ff-only', '--autostash', '--quiet', $ret.Upstream))
+        $ret.Status = if ($LASTEXITCODE -eq 0) { 'FastForward' } else { 'Failed' }
+    } else {
+        $ret.Output = @(& $git @('rebase', '--autostash', '--quiet', $ret.Upstream))
+        if ($LASTEXITCODE -eq 0) {
+            $ret.Status = 'Rebased'
+        } else {
+            $ret.Conflicts = @(& $git @('-c', 'core.quotePath=false', 'diff', '--name-only', '--diff-filter=U'))
+            $ret.Status = if ($ret.Conflicts) { 'Conflict' } else { 'Failed' }
+            if (& $isBusy) { $null = & $git @('rebase', '--abort') }
+        }
+    }
+    $ret.NewHead = & $git @('rev-parse', 'HEAD')
+    return $ret
+}
+
 function Invoke-GitLog {
     [CmdletBinding()]
     param (
@@ -283,7 +425,9 @@ function Invoke-GitLog {
         [String]$Path,
         [Parameter(Mandatory, ValueFromPipeline)]
         [String]$CommitHash,
-        [String]$Name = ''
+        [String]$Name = '',
+        # End of the logged range; pass the upstream to hide rebased local commits
+        [String]$To = 'HEAD'
     )
     process {
         if ($Name) {
@@ -292,7 +436,7 @@ function Invoke-GitLog {
             }
             $Name = "%Cgreen$($Name.PadRight(12, ' ').Substring(0, 12))%Creset "
         }
-        Invoke-Git -Path $Path -ArgumentList @('--no-pager', 'log', '--color', '--no-decorate', '--grep=^(chore)', '--invert-grep', '--abbrev=12', "--format=tformat: * %C(yellow)%h%Creset %<|(72,trunc)%s $Name%C(cyan)%cr%Creset", "$CommitHash..HEAD")
+        Invoke-Git -Path $Path -ArgumentList @('--no-pager', 'log', '--color', '--no-decorate', '--grep=^(chore)', '--invert-grep', '--abbrev=12', "--format=tformat: * %C(yellow)%h%Creset %<|(72,trunc)%s $Name%C(cyan)%cr%Creset", "$CommitHash..$To")
     }
 }
 

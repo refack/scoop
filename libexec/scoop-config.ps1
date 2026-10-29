@@ -47,6 +47,9 @@
 #       Could be used for testing specific functionalities before released into all users.
 #       If you want to receive updates earlier to test new functionalities use develop (see: 'https://github.com/ScoopInstaller/Scoop/issues/2939')
 #
+# git_fetch_jobs: 8
+#       Maximum number of buckets fetched concurrently by 'scoop update'.
+#
 # proxy: [username:password@]host:port
 #       By default, Scoop will use the proxy settings from Internet Options, but with anonymous authentication.
 #
