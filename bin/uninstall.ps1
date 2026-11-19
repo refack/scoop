@@ -91,6 +91,9 @@ installed_apps $false | ForEach-Object { # local apps
     do_uninstall $_ $false
 }
 
+# it's outside of the Scoop directory, and has a junction for Scoop itself too
+remove_currents (get_config CURRENTS)
+
 if ($errors) {
     error 'Not all apps could be deleted. Try again or restart.'; exit 1
 }

@@ -38,6 +38,13 @@
 # no_junction: $true|$false
 #       The 'current' version alias will not be used. Shims and shortcuts will point to specific version instead.
 #
+# currents: <path>
+#       A directory with a junction for each app, named after it, to the app's 'current' directory.
+#       For example, with 'E:\currentapps', 'E:\currentapps\git' links to '<root_path>\apps\git\current'.
+#       Setting it links all the installed apps, and moves the links from the previous directory.
+#       Then installs, resets and uninstalls keep the links in step. Global apps are left out.
+#       'scoop config rm currents' removes the links, and the directory if that empties it.
+#
 # scoop_repo: https://github.com/ScoopInstaller/Scoop
 #       Git repository containing scoop source code.
 #       This configuration is useful for custom forks.

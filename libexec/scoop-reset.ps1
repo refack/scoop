@@ -101,6 +101,7 @@ $apps | ForEach-Object {
     }
 
     $dir = link_current $dir
+    link_currents $app $dir $global
     # unset all potential old env before re-adding
     env_rm_path $manifest $dir $persist_dir $global $architecture
     env_rm $manifest $global $architecture

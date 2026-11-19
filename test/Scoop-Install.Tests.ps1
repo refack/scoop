@@ -11,6 +11,8 @@ BeforeAll {
     . "$PSScriptRoot\..\lib\download.ps1" # 'Invoke-ScoopDownload'
     . "$PSScriptRoot\..\lib\decompress.ps1" # 'Invoke-Extraction'
     . "$PSScriptRoot\..\lib\json.ps1" # 'ConvertToPrettyJson'
+    # keep the tests that (un)link an app off the user's real 'currents' directory (in memory only)
+    if ($scoopConfig) { $scoopConfig.PSObject.Properties.Remove('currents') }
 }
 
 Describe 'appname_from_url' -Tag 'Scoop' {
@@ -869,5 +871,156 @@ Describe 'Invoke-HookScript' -Tag 'Scoop' {
         $manifest = [PSCustomObject]@{ pre_install = 'abort "hook failed"' }
 
         { Invoke-HookScript -HookType 'pre_install' -Manifest $manifest -ProcessorArchitecture '64bit' } | Should-Throw '*hook failed*'
+    }
+}
+
+Describe 'currents' -Tag 'Scoop', 'Windows' {
+    BeforeAll {
+        # an installed app: a version directory, and 'current' linked to it unless -Failed
+        function New-TestApp($name, [Switch]$Failed) {
+            New-Item -ItemType Directory "$apps\$name\1.0" -Force | Out-Null
+            $name | Set-Content "$apps\$name\1.0\$name.txt"
+            if (!$Failed) { New-Item -ItemType Junction "$apps\$name\current" -Value "$apps\$name\1.0" | Out-Null }
+            "$apps\$name\current"
+        }
+        function Get-LinkTarget($path) { @((Get-Item -LiteralPath $path -Force).Target)[0] }
+    }
+    BeforeEach {
+        $root = Join-Path $TestDrive ([guid]::NewGuid())
+        $apps = "$root\apps"
+        $currents = "$root\currents"
+        Mock appsdir { $apps }
+        Mock get_config { $default }
+        Mock warn {}
+        Mock info {}
+    }
+
+    It 'links an app to its current directory' {
+        $current = New-TestApp 'app'
+        link_currents 'app' $current $false $currents
+
+        Get-LinkTarget "$currents\app" | Should-Be $current
+        Get-Content "$currents\app\app.txt" | Should-Be 'app'
+    }
+
+    It 'leaves global apps out' {
+        $current = New-TestApp 'app'
+        link_currents 'app' $current $true $currents
+
+        Test-Path $currents | Should-BeFalse
+    }
+
+    It 'relinks its own link' {
+        $current = New-TestApp 'app'
+        link_currents 'app' "$apps\app\1.0" $false $currents
+        link_currents 'app' $current $false $currents
+
+        Get-LinkTarget "$currents\app" | Should-Be $current
+    }
+
+    It 'leaves anything else in the way alone' {
+        $current = New-TestApp 'app'
+        New-Item -ItemType Directory "$currents\app" | Out-Null
+        'mine' | Set-Content "$currents\app\mine.txt"
+        link_currents 'app' $current $false $currents
+
+        Should-Invoke warn -Times 1 -Exactly
+        Get-Content "$currents\app\mine.txt" | Should-Be 'mine'
+        (Get-Item "$currents\app" -Force).Attributes.HasFlag([System.IO.FileAttributes]::ReparsePoint) | Should-BeFalse
+    }
+
+    It 'unlinks the link only, not the app' {
+        $current = New-TestApp 'app'
+        link_currents 'app' $current $false $currents
+        unlink_currents 'app' $false $currents
+
+        Test-Path "$currents\app" | Should-BeFalse
+        Get-Content "$apps\app\1.0\app.txt" | Should-Be 'app'
+    }
+
+    It 'does not unlink a junction that is not into the apps' {
+        New-Item -ItemType Directory "$root\other" | Out-Null
+        New-Item -ItemType Directory $currents | Out-Null
+        New-Item -ItemType Junction "$currents\app" -Value "$root\other" | Out-Null
+        unlink_currents 'app' $false $currents
+
+        Get-LinkTarget "$currents\app" | Should-Be "$root\other"
+    }
+
+    It 'links every app with a current directory' {
+        New-TestApp 'a' | Out-Null
+        New-TestApp 'b' | Out-Null
+        New-TestApp 'failed' -Failed | Out-Null
+        sync_currents $currents $null
+
+        Get-ChildItem $currents -Name | Should-BeCollection @('a', 'b')
+    }
+
+    It 'moves the links from the old directory, and removes it' {
+        New-TestApp 'a' | Out-Null
+        sync_currents "$root\old" $null
+        sync_currents $currents "$root\old"
+
+        Test-Path "$root\old" | Should-BeFalse
+        Get-ChildItem $currents -Name | Should-BeCollection @('a')
+    }
+
+    It 'keeps the old directory when there is something else in it' {
+        New-TestApp 'a' | Out-Null
+        sync_currents "$root\old" $null
+        'mine' | Set-Content "$root\old\mine.txt"
+        sync_currents $currents "$root\old"
+
+        Get-ChildItem "$root\old" -Name | Should-BeCollection @('mine.txt')
+    }
+
+    It 'drops the links of apps that are gone' {
+        New-TestApp 'a' | Out-Null
+        New-TestApp 'gone' | Out-Null
+        sync_currents $currents $null
+        [System.IO.Directory]::Delete("$apps\gone\current")
+        Remove-Item "$apps\gone" -Recurse
+        sync_currents $currents $currents
+
+        Get-ChildItem $currents -Name | Should-BeCollection @('a')
+    }
+
+    It 'removes the links and the directory, but not the apps' {
+        New-TestApp 'a' | Out-Null
+        sync_currents $currents $null
+        sync_currents $null $currents
+
+        Test-Path $currents | Should-BeFalse
+        Get-Content "$apps\a\1.0\a.txt" | Should-Be 'a'
+    }
+
+    It 'is set as a full path by scoop config, and links the apps' {
+        New-TestApp 'a' | Out-Null
+        Push-Location $root
+        try {
+            $value = Complete-ConfigChange 'currents' 'links'
+        } finally {
+            Pop-Location
+        }
+
+        # set_config stores what it returns, so nothing else may be in there
+        $value | Should-Be "$root\links"
+        Get-ChildItem "$root\links" -Name | Should-BeCollection @('a')
+    }
+
+    It 'is linked wherever current is' {
+        # 'unlink_current' isn't paired the same way: 'bin\uninstall.ps1' removes them all at once
+        $calls = foreach ($file in 'lib\install.ps1', 'lib\update.ps1', 'libexec\scoop-reset.ps1') {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile("$PSScriptRoot\..\$file", [ref]$null, [ref]$null)
+            $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] -and $args[0].GetCommandName() -eq 'link_current' }, $true)
+        }
+        # install_app, restore_app and scoop-reset
+        $calls | Should-BeCollection -Count 3
+        foreach ($call in $calls) {
+            $block = $call.Parent
+            while ($block -isnot [System.Management.Automation.Language.ScriptBlockAst]) { $block = $block.Parent }
+            $linked = $block.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] -and $args[0].GetCommandName() -eq 'link_currents' }, $true)
+            @($linked).Count | Should-Be 1
+        }
     }
 }

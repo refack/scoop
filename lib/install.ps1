@@ -129,6 +129,7 @@ function install_version($app, $manifest, $version, $architecture, $global, $buc
         ensure_install_dir_not_in_path $dir $global
         $dir = link_current $dir
         $linked = $true
+        link_currents $app $dir $global
         link_app $manifest $dir $original_dir $persist_dir $global $architecture
 
         Invoke-HookScript -HookType 'post_install' -Manifest $manifest -ProcessorArchitecture $architecture
@@ -310,6 +311,87 @@ function unlink_current($versiondir) {
     return $versiondir
 }
 
+# The 'currents' config names a directory with a junction for each local app, named after it,
+# to its 'current' directory (the version directory with 'no_junction'). Global apps are left
+# out, one could have the name of a local app. Only junctions into the local apps directory are
+# Scoop's, anything else in the way is left alone.
+
+function link_target($path) { @((Get-Item -LiteralPath $path -Force).Target)[0] }
+
+# $null if there's nothing at $path, 'scoop' for a junction of Scoop's, otherwise 'other'
+function currents_link_state($path) {
+    try {
+        # unlike Test-Path, doesn't follow the link, so it sees a dangling one too
+        $attributes = [System.IO.File]::GetAttributes($path)
+    } catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] {
+        return $null
+    }
+    if ($attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        $target = link_target $path
+        $apps = [System.IO.Path]::GetFullPath((appsdir $false)).TrimEnd('\') + '\'
+        if ($target -and $target.StartsWith($apps, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return 'scoop'
+        }
+    }
+    return 'other'
+}
+
+# Creates or updates the app's junction in the 'currents' directory,
+# to $dir, the app's 'current' directory as returned by 'link_current'.
+function link_currents($app, $dir, $global, $currents = (get_config CURRENTS)) {
+    if ($global -or !$currents) { return }
+    $link = Join-Path $currents $app
+    switch (currents_link_state $link) {
+        # not a recursive delete, that would follow the junction
+        'scoop' { [System.IO.Directory]::Delete($link) }
+        'other' {
+            warn "'$(friendly_path $link)' is in the way of the link to '$app', skipping it."
+            return
+        }
+    }
+    ensure $currents | Out-Null
+    New-DirectoryJunction $link $dir | Out-Null
+}
+
+# Removes the app's junction from the 'currents' directory.
+function unlink_currents($app, $global, $currents = (get_config CURRENTS)) {
+    if ($global -or !$currents) { return }
+    $link = Join-Path $currents $app
+    if ((currents_link_state $link) -eq 'scoop') {
+        [System.IO.Directory]::Delete($link)
+    }
+}
+
+# Removes Scoop's junctions from the 'currents' directory, and then the directory, if that
+# emptied it. With -Stale only those whose app is gone.
+function remove_currents($currents, [Switch]$Stale) {
+    if (!$currents -or !(Test-Path -LiteralPath $currents -PathType Container)) { return }
+    Get-ChildItem -LiteralPath $currents -Force | Where-Object {
+        # Test-Path is true for a dangling junction itself, so it checks the target, the app's 'current'
+        ((currents_link_state $_.FullName) -eq 'scoop') -and !($Stale -and (Test-Path -LiteralPath (link_target $_.FullName)))
+    } | ForEach-Object { [System.IO.Directory]::Delete($_.FullName) }
+    if (!$Stale -and !(Get-ChildItem -LiteralPath $currents -Force)) {
+        Remove-Item -LiteralPath $currents
+    }
+}
+
+# Moves the junctions from the $old 'currents' directory to the new one, $currents (if any),
+# and brings them up to date: one for each local app, Scoop itself included.
+function sync_currents($currents, $old) {
+    if ($old -and ($old -ne $currents)) {
+        remove_currents $old
+    }
+    if (!$currents) { return }
+    foreach ($app in @(Get-ChildItem -LiteralPath (appsdir $false) -Directory -Name -ErrorAction Ignore)) {
+        $dir = currentdir $app $false
+        # with 'no_junction', an app without any version (a failed install) gets the app directory, '...\<app>\'
+        if (!$dir.EndsWith('\') -and (Test-Path -LiteralPath $dir)) {
+            link_currents $app $dir $false $currents
+        }
+    }
+    remove_currents $currents -Stale
+}
+
 # The caller links 'current' first, so $dir is the linked directory.
 function link_app($manifest, $dir, $original_dir, $persist_dir, $global, $architecture) {
     New-ShimFromManifest $manifest $dir $global $architecture
@@ -331,6 +413,7 @@ function unlink_app($app, $manifest, $dir, $persist_dir, $global, $architecture)
     # as the reference directory. Otherwise it will just be the version
     # directory.
     $refdir = unlink_current $dir
+    unlink_currents $app $global
     uninstall_psmodule $manifest $refdir $global
     env_rm_path $manifest $refdir $persist_dir $global $architecture
     env_rm $manifest $global $architecture
